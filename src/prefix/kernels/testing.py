@@ -24,8 +24,10 @@ class AttnCase:
     """One attention problem.
 
     ``q_len`` new queries attend to ``kv_len`` stored keys. ``num_evicted > 0``
-    means the evicted ``[prefix ++ tail]`` cache layout. ``prefix_length`` may
-    be a tuple to give each batch row its own P (and likewise ``num_evicted``).
+    means the evicted ``[prefix ++ tail]`` cache layout. ``kv_start > 0``
+    means left padding: positions ``[0, S)`` are pads. ``prefix_length`` may
+    be a tuple to give each batch row its own P (likewise ``num_evicted`` and
+    ``kv_start``).
     """
 
     name: str
@@ -38,6 +40,7 @@ class AttnCase:
     prefix_length: int | tuple[int, ...]
     window_size: int
     num_evicted: int | tuple[int, ...] = 0
+    kv_start: int | tuple[int, ...] = 0
 
     def __str__(self) -> str:
         return self.name
@@ -51,7 +54,9 @@ class AttnCase:
 
 
 def make_inputs(case: AttnCase, dtype=torch.bfloat16, device="cpu", seed: int = 0, requires_grad=False):
-    """Deterministic inputs: ``(q, k, v, kwargs-for-attention_ref)``."""
+    """Deterministic inputs: ``(q, k, v, kwargs-for-attention_ref)``.
+
+    ``kwargs`` holds ``kv_start`` only for padded cases."""
     g = torch.Generator(device="cpu").manual_seed(seed)
     shape_q = (case.batch, case.heads_q, case.q_len, case.head_dim)
     shape_kv = (case.batch, case.heads_kv, case.kv_len, case.head_dim)
@@ -64,6 +69,8 @@ def make_inputs(case: AttnCase, dtype=torch.bfloat16, device="cpu", seed: int = 
         window_size=case.window_size,
         num_evicted=case.per_seq(case.num_evicted, device),
     )
+    if case.kv_start != 0:
+        kwargs["kv_start"] = case.per_seq(case.kv_start, device)
     return q, k, v, kwargs
 
 
@@ -114,8 +121,8 @@ def reference_and_baseline(q, k, v, **kwargs):
     return attention_ref(q, k, v, **kwargs), attention_ref(q, k, v, compute_dtype=q.dtype, **kwargs)
 
 
-def _c(name, B, Hq, Hkv, Nq, Nk, D, P, W, E=0):
-    return AttnCase(name, B, Hq, Hkv, Nq, Nk, D, P, W, E)
+def _c(name, B, Hq, Hkv, Nq, Nk, D, P, W, E=0, S=0):
+    return AttnCase(name, B, Hq, Hkv, Nq, Nk, D, P, W, E, S)
 
 
 # The plan's matrix, kept small enough for the CPU reference. Block sizes the
@@ -149,4 +156,17 @@ CASES: list[AttnCase] = [
     # --- decode before any eviction (masking-only cache) ---------------------
     _c("decode_no_evict", 1, 4, 2, 1, 50, 64, 10, 64),
     _c("chunk_no_evict_window_bites", 1, 4, 2, 40, 300, 64, 10, 64),
+]
+
+# Left padding (kv_start = S): positions [0, S) are pads, and the caller's
+# prefix length already counts them (P = S + real prefix). Pad queries are
+# empty rows. Kept apart from CASES until every kernel takes kv_start.
+PADDED_CASES: list[AttnCase] = [
+    _c("pad_train", 2, 4, 2, 257, 257, 64, (37 + 50, 37), 64, 0, (50, 0)),
+    _c("pad_train_per_seq", 3, 4, 2, 180, 180, 64, (31 + 63, 31 + 64, 31 + 65), 40, 0, (63, 64, 65)),
+    _c("pad_train_gqa6", 2, 12, 2, 160, 160, 128, (20 + 100, 20 + 1), 40, 0, (100, 1)),
+    _c("pad_train_all_rows", 2, 4, 2, 140, 140, 64, (140, 10), 16, 0, (140, 0)),  # row 0: all pads
+    _c("pad_chunk_q16", 2, 4, 2, 16, 37 + 63 + 16, 64, (37, 37), 64, (211, 5), (30, 37)),
+    _c("pad_decode_q1", 2, 4, 2, 1, 37 + 63 + 1, 64, (37, 30), 64, (500, 0), (20, 29)),
+    _c("pad_chunk_no_evict", 2, 4, 2, 40, 300, 64, (10 + 129, 10), 64, 0, (129, 0)),
 ]

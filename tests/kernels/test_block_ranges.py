@@ -8,6 +8,9 @@ in bounds ("full"), and require the Python plans to match *exactly*:
 * backward: q_block_range              == live query tiles
 * masking:  tile_needs_mask            == not full
 
+Layouts include left padding (``kv_start``): key tiles entirely below it
+must be skipped and the tile straddling it masked.
+
 Hypothesis shrinks failures to a minimal config (small P, W, N, blocks).
 More examples: HYPOTHESIS_PROFILE=thorough.
 """
@@ -36,6 +39,7 @@ def tile_tables(cfg: TileConfig) -> tuple[torch.Tensor, torch.Tensor]:
         key_positions(lay.kv_len, lay.prefix_length, lay.num_evicted),
         lay.prefix_length,
         lay.window_size,
+        lay.kv_start,
     )[0]
     mt, nt = _cdiv(lay.q_len, bm), _cdiv(lay.kv_len, bn)
     padded = torch.zeros(mt * bm, nt * bn, dtype=torch.bool)  # out of bounds = not allowed
@@ -44,8 +48,8 @@ def tile_tables(cfg: TileConfig) -> tuple[torch.Tensor, torch.Tensor]:
     return tiles.any(3).any(1), tiles.all(3).all(1)
 
 
-def _cfg(bm, bn, kind, q_len, kv_len, P, W, E, q_start) -> TileConfig:
-    return TileConfig(Layout(kind, q_len, kv_len, P, W, E, q_start), bm, bn)
+def _cfg(bm, bn, kind, q_len, kv_len, P, W, E, q_start, S=0) -> TileConfig:
+    return TileConfig(Layout(kind, q_len, kv_len, P, W, E, q_start, S), bm, bn)
 
 
 EDGE_CASES = [
@@ -59,6 +63,16 @@ EDGE_CASES = [
     _cfg(16, 16, "train", 60, 60, 0, 17, 0, 0),
     # every row empty: keys all after the queries
     _cfg(4, 4, "explicit", 3, 5, 0, 4, 100, 50),
+    # padding: S inside a prefix tile, at a tile boundary, == P
+    _cfg(4, 8, "train", 40, 40, 21, 5, 0, 0, 13),
+    _cfg(4, 8, "train", 40, 40, 21, 5, 0, 0, 16),
+    _cfg(8, 4, "train", 40, 40, 12, 9, 0, 0, 12),
+    # padding past the prefix (in the tail), and covering every query
+    _cfg(4, 4, "train", 30, 30, 5, 6, 0, 0, 17),
+    _cfg(4, 4, "train", 30, 30, 5, 6, 0, 0, 30),
+    # padding with eviction: S in the evicted gap, and in the tail
+    _cfg(4, 8, "evicted", 6, 30, 10, 20, 40, 64, 25),
+    _cfg(4, 8, "evicted", 6, 30, 10, 20, 40, 64, 55),
 ]
 
 
@@ -117,7 +131,26 @@ def test_fwd_schedule_is_exact_and_split(cfg: TileConfig) -> None:
         assert all(full[m, n] for n in unmasked), f"m={m}: unmasked tile not full {segments}"
         if (m + 1) * bm <= lay.q_len:  # complete query tile: only edge tiles masked
             masked = len(visited) - len(unmasked)
-            assert masked <= 3 * _cdiv(bm, bn) + 4, f"m={m}: {masked} masked tiles {segments}"
+            assert masked <= 3 * _cdiv(bm, bn) + 5, f"m={m}: {masked} masked tiles {segments}"
+        if lay.kv_start == 0:  # unpadded: the original five-segment plan
+            assert not segments[0][0], f"m={m}: padding segment without padding {segments}"
+
+
+@settings(max_examples=examples(5))
+@given(tile_configs(padded=True))
+def test_padding_adds_at_most_one_masked_tile(cfg: TileConfig) -> None:
+    """Padding only removes work: the padded plan visits a subset of the
+    unpadded plan's tiles, with at most one extra masked tile (the one
+    straddling kv_start)."""
+    lay = cfg.layout
+    unpadded = TileConfig(Layout(**{**lay.__dict__, "kv_start": 0}), cfg.block_m, cfg.block_n)
+    for m in range(_cdiv(lay.q_len, cfg.block_m)):
+        seg_p = fwd_schedule(m, **cfg.kwargs())
+        seg_u = fwd_schedule(m, **unpadded.kwargs())
+        tiles = lambda segs, masked: {n for t, mk in segs if mk == masked for n in t}  # noqa: E731
+        all_p, all_u = tiles(seg_p, True) | tiles(seg_p, False), tiles(seg_u, True) | tiles(seg_u, False)
+        assert all_p <= all_u, f"m={m}: {seg_p} vs {seg_u}"
+        assert len(tiles(seg_p, True) - tiles(seg_u, True)) <= 1, f"m={m}: {seg_p} vs {seg_u}"
 
 
 def test_work_independent_of_sequence_length() -> None:

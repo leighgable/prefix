@@ -4,7 +4,7 @@ Shared by the reference tests (Milestone 1) and the kernel tests (Milestone 2+).
 Keep drawn values *small*: Hypothesis shrinks failures toward the minimal
 config, and a 5-token counterexample is far easier to debug than a 60-token one.
 
-* ``layouts``         – (q_len, kv_len, P, W, E, q_start) in one of four modes.
+* ``layouts``         – (q_len, kv_len, P, W, E, q_start[, S]) in one of four modes.
 * ``tile_configs``    – a layout plus block sizes, for the tile-plan properties.
 * ``chunk_schedules`` – (P, W, chunk sizes) to drive the real cache layer.
 * ``attn_shapes``     – batch / heads / head_dim / layout for dense checks.
@@ -44,6 +44,9 @@ class Layout:
     ``cache``    masking-only cache: kv_len - q_len keys already stored, none evicted
     ``evicted``  [prefix ++ tail] cache with ``num_evicted`` tokens missing in between
     ``explicit`` arbitrary q_start / E, possibly inconsistent (empty rows possible)
+
+    ``kv_start`` (S, any kind): keys at positions < S are padding. Drawn only
+    with ``layouts(padded=True)``; queries at positions < S are empty rows.
     """
 
     kind: str
@@ -53,6 +56,7 @@ class Layout:
     window_size: int
     num_evicted: int
     q_start: int
+    kv_start: int = 0
 
     def kwargs(self) -> dict:
         d = asdict(self)
@@ -60,13 +64,20 @@ class Layout:
         return d
 
     def ref_kwargs(self) -> dict:
-        """Keyword arguments for ``attention_ref`` (q_len / kv_len come from tensors)."""
-        return dict(
+        """Keyword arguments for ``attention_ref`` (q_len / kv_len come from tensors).
+
+        ``kv_start`` only when nonzero, so unpadded layouts also fit
+        functions without a ``kv_start`` parameter.
+        """
+        d = dict(
             prefix_length=self.prefix_length,
             window_size=self.window_size,
             num_evicted=self.num_evicted,
             q_start=self.q_start,
         )
+        if self.kv_start:
+            d["kv_start"] = self.kv_start
+        return d
 
 
 @dataclass(frozen=True)
@@ -100,16 +111,41 @@ def _aligned(block_m: int, block_n: int, lo: int, upper: int) -> st.SearchStrate
     return st.one_of(targeted.filter(lambda x: lo <= x <= upper), st.integers(lo, upper))
 
 
+def _kv_start(draw, lay: Layout, block: int | None, blocks: tuple[int, int] | None) -> Layout:
+    """Add a padding bound S in [0, last query + 1] (the top value masks every
+    query). Biased toward 0, P, the queries and tile boundaries."""
+    hi = max(0, lay.q_start + lay.q_len)
+    near = [0, hi, min(lay.prefix_length, hi), min(max(lay.q_start, 0), hi)]
+    if blocks is not None:
+        tiled = _aligned(*blocks, 0, hi)
+    else:
+        tiled = _near(block or 1, hi).map(lambda x: min(x, hi))
+    S = draw(st.one_of(st.just(0), st.sampled_from(near), tiled, st.integers(0, hi)))
+    return Layout(**{**asdict(lay), "kv_start": S})
+
+
 @st.composite
 def layouts(
-    draw, kinds=KINDS, max_len: int = 60, block: int | None = None, blocks: tuple[int, int] | None = None
+    draw,
+    kinds=KINDS,
+    max_len: int = 60,
+    block: int | None = None,
+    blocks: tuple[int, int] | None = None,
+    padded: bool = False,
 ) -> Layout:
     """A per-sequence layout.
 
     ``block`` biases P and W toward multiples of a tile size (tile-plan tests,
     tiny blocks). ``blocks=(block_m, block_n)`` biases P, W and lengths toward
     the boundaries of a real kernel config (kernel tests; see ``_aligned``).
+    ``padded`` also draws a padding bound ``kv_start`` (else 0).
     """
+    lay = draw(_base_layouts(kinds, max_len, block, blocks))
+    return _kv_start(draw, lay, block, blocks) if padded else lay
+
+
+@st.composite
+def _base_layouts(draw, kinds, max_len: int, block: int | None, blocks: tuple[int, int] | None) -> Layout:
     kind = draw(st.sampled_from(kinds))
     if blocks is not None:
         bm, bn = blocks
@@ -142,10 +178,10 @@ def layouts(
 
 
 @st.composite
-def tile_configs(draw, kinds=KINDS, max_len: int = 60) -> TileConfig:
+def tile_configs(draw, kinds=KINDS, max_len: int = 60, padded: bool = True) -> TileConfig:
     block_m = draw(st.sampled_from([1, 2, 4, 8, 16]))
     block_n = draw(st.sampled_from([1, 2, 4, 8, 16]))
-    layout = draw(layouts(kinds=kinds, max_len=max_len, block=block_n))
+    layout = draw(layouts(kinds=kinds, max_len=max_len, block=block_n, padded=padded))
     return TileConfig(layout, block_m, block_n)
 
 
@@ -174,15 +210,21 @@ class AttnShape:
 
 @st.composite
 def attn_shapes(
-    draw, kinds=CONSISTENT_KINDS, max_len: int = 40, head_dims=(4, 8, 16), blocks: tuple[int, int] | None = None
+    draw,
+    kinds=CONSISTENT_KINDS,
+    max_len: int = 40,
+    head_dims=(4, 8, 16),
+    blocks: tuple[int, int] | None = None,
+    padded: bool = False,
 ) -> AttnShape:
     """Dense-attention problem. Pass the kernel's ``blocks=(BLOCK_M, BLOCK_N)``
-    when testing a kernel so lengths and P / W land on its tile boundaries."""
+    when testing a kernel so lengths and P / W land on its tile boundaries.
+    ``padded``: also draw a padding bound ``kv_start``."""
     return AttnShape(
         batch=draw(st.integers(1, 2)),
         heads_kv=draw(st.integers(1, 2)),
         group=draw(st.sampled_from([1, 2, 3])),
         head_dim=draw(st.sampled_from(head_dims)),
-        layout=draw(layouts(kinds=kinds, max_len=max_len, blocks=blocks)),
+        layout=draw(layouts(kinds=kinds, max_len=max_len, blocks=blocks, padded=padded)),
         seed=draw(st.integers(0, 2**16)),
     )

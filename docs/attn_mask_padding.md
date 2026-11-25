@@ -1,6 +1,7 @@
 # Handoff: padding support (`kv_start`) in the prefix sliding kernels
 
-Status: **ready to start**. Written at the end of a session in the llung
+Status: **milestone 1 done** (see "Progress" at the end).
+Originally: Written at the end of a session in the llung
 repo (`~/Code/llung`), which consumes this repo for `LatentLM`'s
 attention. Decisions below are made — implement, don't re-litigate.
 
@@ -144,3 +145,41 @@ Run the relevant tests after each one, and the full suite at the end.
    Tests: a padded batch equals each row run on its own.
 3. Then refresh this repo's `docs/` snapshot from llung, so the sketch
    tests here cover the padded LatentLM too.
+
+## Progress
+
+**Milestone 1 (reference): done.**
+- `reference.py`: `kv_start` in `allowed_mask`, `attention_ref`,
+  `attention_ref_positions`, `validate_layout` (S >= 0) and all four
+  planners. The planners use `s_0 = _stored_first_at_or_after(S, P, E)`:
+  - `kv_block_ranges`: the prefix range is `[s_0 // BN, cdiv(pre_hi, BN))` if
+    `s_0 < pre_hi`, else empty `(0, 0)`. The window starts at
+    `max(s_lo, s_0)`, and `a_end` (used for disjointness) is 0 when the
+    prefix range is empty. **The prefix range no longer starts at tile 0.**
+  - `fwd_schedule` now has **six segments**: a new leading masked prefix
+    segment `[a_start, a_lo)` (at most the one tile straddling `s_0`),
+    with `a_lo = min(max(cdiv(s_0, BN), a_start), a_end)` and `a_full`
+    clamped to `[a_lo, a_end]`. `b_full_lo` gets `s_0` inside its `max(...)`.
+    At S = 0 the first segment is empty and the rest is the old plan.
+  - `tile_needs_mask`: `c0 < s_0` -> masked. Pad queries need no check:
+    causality already rules them out.
+  - `q_block_range`: `c0 = max(c0, s_0)` (only the tile's real keys).
+- `strategies.py`: `Layout.kv_start` (default 0), `layouts(padded=...)`,
+  `attn_shapes(padded=...)`, `tile_configs(padded=True)`. `ref_kwargs()`
+  emits `kv_start` only when nonzero, so kernel tests still run unchanged
+  until the kernels accept it.
+- `testing.py`: `AttnCase.kv_start` (int or per-row tuple), `make_inputs`
+  (emits `kv_start` only when nonzero), and `PADDED_CASES`, kept apart from
+  `CASES` until the kernels take `kv_start`. Fold them in at milestone 2/3.
+- Tests: the planners stay exact under padding (also passes 20x examples
+  with `HYPOTHESIS_PROFILE=thorough`); padding only removes tiles, with at
+  most one extra masked tile; a padded batch equals each row run unpadded
+  (out, LSE, dq/dk/dv/d_rel_bias, fp64, exact); pad rows/keys are NaN-free
+  with zero gradients; gradcheck covers padded layouts; flex_attention
+  agrees on the padded cases.
+- Baseline is now 502 passed (this env).
+- **llung env:** 12 `tests/test_integration.py` cache tests (the `ring` /
+  `eviction` caches and `generate`) already fail **at HEAD `21e053b`**
+  (torch 2.15.0, transformers 5.24.1 there, vs 5.22.2 here). That's
+  unrelated to padding, but it blocks the "green in llung's env"
+  acceptance; look at it before/with milestone 4.
