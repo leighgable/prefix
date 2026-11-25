@@ -8,6 +8,7 @@ to the logits, as in ``Block.forward``) plus the prefix-sliding mask, in fp64.
 """
 
 import importlib.util
+import sys
 from pathlib import Path
 
 import pytest
@@ -195,6 +196,9 @@ def test_unsupported_models_raise() -> None:
 @pytest.fixture(scope="module")
 def sketch():
     path = Path(__file__).resolve().parents[1] / "docs" / "transformer.py"
+    # transformer.py imports its sibling modules (residual.py, feedback.py)
+    if str(path.parent) not in sys.path:
+        sys.path.insert(0, str(path.parent))
     spec = importlib.util.spec_from_file_location("latent_sketch", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

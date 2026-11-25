@@ -4,6 +4,7 @@ relative bias + prefix sliding attention)."""
 import copy
 import importlib.util
 import math
+import sys
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,9 @@ GPU = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 @pytest.fixture(scope="module")
 def sketch():
     path = Path(__file__).resolve().parents[1] / "docs" / "transformer.py"
+    # transformer.py imports its sibling modules (residual.py, feedback.py)
+    if str(path.parent) not in sys.path:
+        sys.path.insert(0, str(path.parent))
     spec = importlib.util.spec_from_file_location("latent_sketch_fixed", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
