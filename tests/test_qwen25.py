@@ -212,3 +212,174 @@ def test_generate_with_eviction_cache(model, tokenizer, prompt_ids, cfg):
     text = tokenizer.decode(out[0, P:], skip_special_tokens=True)
     assert text.strip()
     print(f"\n--- prefix sliding (P={P}, W={WINDOW}), cache holds {cfg.max_cached} tokens ---\n{text}")
+
+
+# --------------------------------------------------------------------------
+# Milestone 3 exit: a training step through the Triton kernel
+# --------------------------------------------------------------------------
+# A test-only attention backend that routes every layer to the differentiable
+# Triton op (Milestone 5 will make this a real, model-agnostic integration).
+# Reference: eager attention + the explicit 4D mask. fp32 eager is fine on
+# ROCm (only fp32 *sdpa* is broken).
+
+KERNEL_BACKEND = "prefix_sliding_triton_test"
+
+
+@pytest.fixture(scope="module")
+def kernel_backend(cfg):
+    from transformers import AttentionInterface
+    from transformers.masking_utils import AttentionMaskInterface
+
+    from prefix.kernels.ops import prefix_sliding_attention
+
+    def attention(module, query, key, value, attention_mask, scaling=None, dropout=0.0, **kwargs):
+        out = prefix_sliding_attention(
+            query, key, value, prefix_length=cfg.prefix_length, window_size=cfg.window_size, scale=scaling
+        )
+        return out.transpose(1, 2), None  # [B, N, H, D], contiguous by construction
+
+    AttentionInterface.register(KERNEL_BACKEND, attention)
+    AttentionMaskInterface.register(KERNEL_BACKEND, lambda *args, **kwargs: None)  # kernel builds its own mask
+    return KERNEL_BACKEND
+
+
+@pytest.fixture(scope="module")
+def model_fp32():
+    m = AutoModelForCausalLM.from_pretrained(MODEL_PATH, dtype=torch.float32, attn_implementation="eager")
+    yield m.to(DEVICE).eval()
+    del m
+    torch.cuda.empty_cache()
+
+
+@pytest.fixture(scope="module")
+def grad_reference(sequence, cfg):
+    """fp64 eager + explicit mask: (loss, {param: grad}) kept on the CPU.
+
+    Comparing the kernel with eager fp32 directly can't tell which one is off;
+    both are judged against this instead (the FlashAttention rule).
+    """
+    m = AutoModelForCausalLM.from_pretrained(MODEL_PATH, dtype=torch.float64, attn_implementation="eager")
+    m = m.to(DEVICE).eval()
+    n = sequence.shape[1]
+    loss, grads = train_step(m, sequence, "eager", prefix_sliding_mask(n, n, cfg, device=DEVICE, dtype=torch.float64))
+    grads = {name: g.cpu() for name, g in grads.items()}
+    del m
+    torch.cuda.empty_cache()
+    return loss, grads
+
+
+def train_step(model, ids, attn: str, attention_mask=None) -> tuple[float, dict[str, torch.Tensor]]:
+    """One LM loss forward + backward with ``attn``; returns (loss, fp32/fp64 grads)."""
+    previous = model.config._attn_implementation
+    model.set_attn_implementation(attn)
+    try:
+        model.zero_grad(set_to_none=True)
+        loss = model(ids, attention_mask=attention_mask, labels=ids, use_cache=False).loss
+        loss.backward()
+        grads = {n: p.grad.detach().to(torch.promote_types(p.dtype, torch.float32)) for n, p in model.named_parameters()
+                 if p.grad is not None}  # fmt: skip
+        model.zero_grad(set_to_none=True)
+        return loss.item(), grads
+    finally:
+        model.set_attn_implementation(previous)
+
+
+def rel_errors(grads, ref) -> dict[str, float]:
+    """Per-parameter ||g - ref|| / ||ref|| (ref may live on the CPU)."""
+    out = {}
+    for name, r in ref.items():
+        r = r.to(grads[name].device, torch.float64)
+        out[name] = ((grads[name].double() - r).norm() / r.norm().clamp_min(1e-300)).item()
+    return out
+
+
+def _median(d: dict[str, float]) -> float:
+    return sorted(d.values())[len(d) // 2]
+
+
+def _compare(kernel_errs, base_errs, label):
+    ratio = {n: kernel_errs[n] / max(base_errs[n], 1e-12) for n in kernel_errs}
+    worst = max(ratio, key=ratio.get)
+    print(
+        f"\n{label}: median grad rel err vs fp64: kernel {_median(kernel_errs):.2e}, eager {_median(base_errs):.2e}; "
+        f"worst ratio {ratio[worst]:.2f} ({worst}: {kernel_errs[worst]:.2e} vs {base_errs[worst]:.2e})"
+    )
+    return ratio
+
+
+def test_training_step_fp32(model_fp32, sequence, cfg, kernel_backend, grad_reference):
+    """fp32 kernel gradients are as close to fp64 as eager fp32's.
+
+    Measured: medians equal (~9e-5); worst parameter ~3x eager (a layer-0
+    bias). Qwen2.5's layer 0 has attention scores ~2e4, which is what made the
+    kernel's exp2 / stats handling matter (see bwd.py)."""
+    ref_loss, ref = grad_reference
+    n = sequence.shape[1]
+    loss, kernel = train_step(model_fp32, sequence, kernel_backend)
+    kernel_errs = rel_errors(kernel, ref)
+    del kernel
+    base_loss, base = train_step(model_fp32, sequence, "eager", prefix_sliding_mask(n, n, cfg, device=DEVICE))
+    base_errs = rel_errors(base, ref)
+    del base
+
+    ratio = _compare(kernel_errs, base_errs, "fp32")
+    assert len(kernel_errs) == sum(1 for _ in model_fp32.parameters())  # every param got a grad
+    assert abs(loss - ref_loss) <= 2 * abs(base_loss - ref_loss) + 1e-6
+    assert _median(kernel_errs) <= 1.5 * _median(base_errs)
+    assert max(ratio.values()) <= 5.0
+
+
+def test_training_step_bf16(model, sequence, cfg, kernel_backend, grad_reference):
+    """bf16 kernel gradients are no further from fp64 than plain bf16 eager's."""
+    _, ref = grad_reference
+    n = sequence.shape[1]
+    _, kernel = train_step(model, sequence, kernel_backend)
+    kernel_errs = rel_errors(kernel, ref)
+    del kernel
+    _, base = train_step(model, sequence, "eager", prefix_sliding_mask(n, n, cfg, device=DEVICE, dtype=torch.bfloat16))
+    base_errs = rel_errors(base, ref)
+    del base
+
+    _compare(kernel_errs, base_errs, "bf16")
+    assert all(kernel_errs[n] <= 2 * base_errs[n] + 1e-3 for n in kernel_errs)
+
+
+# --------------------------------------------------------------------------
+# Milestone 4: ring-buffer cache + Triton decode kernel
+# --------------------------------------------------------------------------
+
+
+def test_ring_cache_triton_teacher_forced(model, sequence, cfg):
+    """Prefill the prompt, then decode token by token through the ring cache."""
+    from prefix.modeling.cache import PrefixSlidingRingCache
+
+    ref = reference_logits(model, sequence, cfg)
+    install(model, cfg, backend="triton")
+    try:
+        cache = PrefixSlidingRingCache(cfg, model.config)
+        got = incremental_logits(model, sequence, cfg.prefix_length, cache)
+    finally:
+        uninstall(model)
+    assert max_kl(ref, got) < MAX_KL
+    assert_argmax_or_tie(ref[0], got[0].argmax(-1))
+    layer = cache.layers[0]
+    assert cache.get_seq_length() == sequence.shape[1]
+    assert layer.keys.shape[2] == cfg.prefix_length + cfg.window_size - 1 + cache.max_chunk  # fixed size
+
+
+def test_generate_ring_cache_triton(model, tokenizer, prompt_ids, cfg):
+    from prefix.modeling.cache import PrefixSlidingRingCache
+
+    install(model, cfg, backend="triton")
+    try:
+        cache = PrefixSlidingRingCache(cfg, model.config)
+        with torch.no_grad():
+            out = model.generate(prompt_ids, past_key_values=cache, **GREEDY)
+    finally:
+        uninstall(model)
+    P, n = cfg.prefix_length, out.shape[1]
+    assert n == P + NEW_TOKENS and cache.get_seq_length() == n - 1
+    ref = reference_logits(model, out, cfg)[0, P - 1 : n - 1]
+    assert_argmax_or_tie(ref, out[0, P:])
+    print(f"\n--- ring cache + Triton decode (P={P}, W={WINDOW}) ---\n"
+          f"{tokenizer.decode(out[0, P:], skip_special_tokens=True)}")  # fmt: skip

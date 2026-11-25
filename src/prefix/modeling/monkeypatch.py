@@ -1,4 +1,4 @@
-"""Monkeypatch utilities for Prefix Sliding Attention on Qwen2.5.
+"""Prefix sliding attention: config, reference masks and caches.
 
 A query at absolute position ``q`` may attend to key ``k`` iff
 
@@ -9,43 +9,42 @@ i.e. the first ``P`` tokens (the prefix: system prompt, tools, task) plus the
 reset ("ContinuePE" in the paper): RoPE is applied to keys before they are
 cached, so retained tokens keep their original absolute positions.
 
-Two modes, both enabled by ``install()``:
+This module holds the reference pieces:
+
+* ``PrefixSlidingConfig`` (P, W);
+* mask predicates (``prefix_sliding_mask_function``,
+  ``evicted_cache_mask_function``) and the explicit 4D ``prefix_sliding_mask``;
+* ``PrefixSlidingCache``: the simple eviction cache (``torch.cat`` per token;
+  ``prefix.modeling.cache.PrefixSlidingRingCache`` is the fast one);
+* ``install`` / ``uninstall``: the original entry points, now thin wrappers
+  over ``prefix.modeling.integration`` (where the transformers integration
+  for the Qwen family and custom models lives).
+
+Two modes:
 
 1. Masking only (any cache, e.g. the default ``DynamicCache``, or no cache):
    the full KV history is kept and the mask hides the middle. Simple, and the
    reference for everything else.
-2. Eviction (pass ``past_key_values=PrefixSlidingCache(...)``): the cache
-   physically keeps only ``prefix ++ last (W - 1)`` tokens per layer, so memory
-   and per-token cost are bounded by ``P + W - 1``. The patched mask is told
-   how many middle tokens were evicted and maps stored indices back to
-   absolute positions.
+2. Eviction (``PrefixSlidingCache`` / ``PrefixSlidingRingCache``): the cache
+   keeps only ``prefix ++ last (W - 1)`` tokens per layer, so memory and
+   per-token cost are bounded by ``P + W - 1``.
 
-Architecture notes (transformers 5.x):
-  - ``Qwen2Model.forward`` calls ``create_causal_mask`` by the name imported
-    into ``modeling_qwen2`` -> that is the seam we patch.
-  - Mask functions receive ``q_idx = q_offset + i`` (q_offset =
-    ``cache.get_seq_length()``) and ``kv_idx = kv_offset + j`` with
-    ``(kv_length, kv_offset) = layer.get_mask_sizes(q_len)``.
-  - Decode ``position_ids`` come from ``cache.get_seq_length()``, so the
-    eviction cache must report the *cumulative* length, not the stored one.
+transformers notes (5.x): mask functions receive ``q_idx = q_offset + i``
+(q_offset = ``cache.get_seq_length()``) and ``kv_idx = kv_offset + j`` with
+``(kv_length, kv_offset) = layer.get_mask_sizes(q_len)``; decode
+``position_ids`` come from ``cache.get_seq_length()``, so eviction caches
+report the *cumulative* length, not the stored one.
 """
 
 from __future__ import annotations
 
-import inspect
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
 
 import torch
 from transformers.cache_utils import Cache, DynamicCache, DynamicLayer
-from transformers.masking_utils import and_masks
-from transformers.models.qwen2 import modeling_qwen2
 
-# Where we stash the original so uninstall() can restore it.
-_ORIGINAL_ATTR = "_prefix_sliding_original_create_causal_mask"
-# Mask functions are silently ignored by flash-attn (it only handles padding).
-_SUPPORTED_ATTN = ("sdpa", "eager")
 
 
 @dataclass
@@ -257,56 +256,30 @@ def _gather_padding_mask(
 # --------------------------------------------------------------------------
 
 
-def install(model, config: PrefixSlidingConfig) -> None:
-    """Make Qwen2 models build prefix-sliding masks.
+def install(model, config: PrefixSlidingConfig, backend: str = "mask") -> None:
+    """Enable prefix sliding attention on a Qwen-family model.
 
-    Works with any cache (masking-only) and with ``PrefixSlidingCache``
-    (eviction). Patches the *module*, so it affects every Qwen2 model in the
-    process until uninstall().
+    Thin wrapper over ``prefix.modeling.integration.enable_prefix_sliding``
+    (kept for the original API; note the default backend here is "mask").
+
+    backend="mask": the stock eager / sdpa attention with a prefix-sliding mask.
+        Works with any cache (masking-only) and with ``PrefixSlidingCache``.
+    backend="triton": the Triton kernels; also ``PrefixSlidingRingCache``.
+
+    The state is per model (unlike the first version, which patched the
+    module for every Qwen2 model in the process).
 
     Limitation: P counts absolute positions, so left padding eats into the
     prefix. Batches should be unpadded (or right-padded for training).
     """
-    attn = model.config._attn_implementation
-    if attn not in _SUPPORTED_ATTN:
-        raise ValueError(f"prefix sliding needs one of {_SUPPORTED_ATTN}, got {attn!r}")
-    if "sliding_attention" in (getattr(model.config, "layer_types", None) or []):
-        raise ValueError("model has native sliding-window layers; not supported")
-    if hasattr(modeling_qwen2, _ORIGINAL_ATTR):
-        raise RuntimeError("prefix sliding already installed; call uninstall() first")
+    from .integration import enable_prefix_sliding
 
-    original = modeling_qwen2.create_causal_mask
-    signature = inspect.signature(original)
-    keep = prefix_sliding_mask_function(config)
-
-    def patched_create_causal_mask(*args, **kwargs):
-        bound = signature.bind(*args, **kwargs)
-        arguments = bound.arguments
-        cache = arguments.get("past_key_values")
-
-        if isinstance(cache, PrefixSlidingCache):
-            if cache.config != config:
-                raise ValueError(f"cache config {cache.config} != installed config {config}")
-            mask_fn = evicted_cache_mask_function(config, cache.num_evicted())
-            pad = arguments.get("attention_mask")
-            if isinstance(pad, torch.Tensor) and pad.ndim == 2 and len(cache.layers) > 0:
-                q_len = arguments["inputs_embeds"].shape[1]
-                arguments["attention_mask"] = _gather_padding_mask(pad, cache, q_len)
-        else:
-            mask_fn = keep
-
-        existing = arguments.get("and_mask_function")
-        arguments["and_mask_function"] = mask_fn if existing is None else and_masks(existing, mask_fn)
-        return original(*bound.args, **bound.kwargs)
-
-    setattr(modeling_qwen2, _ORIGINAL_ATTR, original)
-    modeling_qwen2.create_causal_mask = patched_create_causal_mask
+    enable_prefix_sliding(model, config, backend=backend)
 
 
 def uninstall(model=None) -> None:
-    """Restore the stock mask builder. No-op if nothing is installed."""
-    original = getattr(modeling_qwen2, _ORIGINAL_ATTR, None)
-    if original is None:
-        return
-    modeling_qwen2.create_causal_mask = original
-    delattr(modeling_qwen2, _ORIGINAL_ATTR)
+    """Disable prefix sliding on ``model`` (or on every model if None). No-op if
+    nothing is enabled."""
+    from .integration import disable_prefix_sliding
+
+    disable_prefix_sliding(model)

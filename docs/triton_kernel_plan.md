@@ -89,6 +89,23 @@ Tolerance rule (FlashAttention convention): measure
 **Exit:** reference agrees with all oracles; `block_ranges` property test passes for
 ~10k random configs.
 
+**Status: done.** `src/prefix/kernels/{reference,testing}.py`, `tests/kernels/`.
+- The plans are *exact*, which is stronger than the original target: visited key tiles ==
+  tiles with ≥1 allowed pair (no wasted tiles, every pair once), for forward
+  (`kv_block_ranges`), backward (`q_block_range`) and `tile_needs_mask`. Holds for
+  arbitrary layouts, not just consistent ones.
+- Property tests use **Hypothesis** (`src/prefix/kernels/strategies.py`): failures shrink
+  to minimal configs (e.g. `q_len=2, P=0, W=1, block 1`) and are replayed first on the
+  next run. Profiles: `default` (~25 s for `tests/kernels`), `HYPOTHESIS_PROFILE=thorough`
+  (20x, ~5 min). GPU/flex tests stay on the fixed `CASES` matrix (each shape recompiles).
+  For M2+: Triton compiles per constexpr config, not per shape, so kernel tests *can*
+  draw shapes from `attn_shapes()`. Keep head_dim / dtype / block sizes as `sampled_from`.
+- Mutation-checked: off-by-one / clamp / disjointness bugs are caught. The two
+  surviving mutants are provably equivalent rewrites.
+- Lesson: the bf16 tolerance rule can't see errors below bf16 noise (a 0.8% scale
+  bug passed it). Every kernel test should also have an **fp32 run with a tight
+  absolute bound**, as `test_matches_flex_attention_fp32` does.
+
 ---
 
 ## Milestone 2 — Forward kernel (prefill / training)
@@ -139,6 +156,24 @@ At most ~2 edge tiles per range; everything else runs without the mask arithmeti
 **Exit:** full test matrix passes; time grows linearly in N at fixed P, W; beats
 flex_attention at N ≥ 4k.
 
+**Status: done.** `src/prefix/kernels/fwd.py`, `tests/kernels/test_fwd.py`, `bench/bench_fwd.py`.
+- Kernel mirrors `reference.fwd_schedule` (5 segments: prefix interior/edge, window
+  lower-edge/interior/causal-edge); the Python schedule is property-tested for exact
+  coverage, unmasked ⊆ full, and ≤ `3·cdiv(BM,BN)+4` masked tiles per complete q tile.
+  Hypothesis found that `pre_hi = min(P, s_hi, s_lo)` forced prefix tiles into the
+  window range (all masked); changed to `min(P, s_hi)`.
+- Accuracy: bf16 error 2–6× *below* the plain-bf16 baseline; fp32 ~1e-6.
+- Bench (890M, B=1, Hq=12, Hkv=2, D=128, P=128, W=1024, bf16): 16k tokens 17.5 ms vs
+  flex 161 ms, dense causal SDPA 137 ms; within ~8–10% of pure sliding window;
+  ~6.4–7.1 effective TFLOP/s vs 6–10 TFLOP/s for a plain bf16 GEMM on this GPU.
+  The full/edge split gives ~0% here (mask ALU is cheap next to the dots on this GPU);
+  kept since it is tested equivalent, revisit in M6 on other hardware.
+- Gotchas: HIP `tl.dot` allows only `ieee`/`bf16x3`/`bf16x6` precision (no tf32);
+  every kernel edit invalidates the Triton cache, so tests use few distinct
+  (config, head_dim, dtype) combos (cold run ~2 min). Alignment bugs in the unmasked
+  path need a specific residue mod BLOCK_N: `test_residue_sweep` covers all residues
+  deterministically (Hypothesis-default missed a mutant there; `thorough` found it).
+
 ---
 
 ## Milestone 3 — Backward (gradient-friendly)
@@ -182,6 +217,42 @@ Prefix kv tiles visit ~N/BM query tiles; window tiles visit ~(W+BN)/BM.
 **Exit:** gradients pass; one training step on Qwen2.5-1.5B (bf16, small seq)
 matches eager+explicit-mask gradients within tolerance.
 
+**Status: done.** `src/prefix/kernels/{bwd,ops}.py`, `tests/kernels/test_bwd.py`,
+`tests/test_qwen25.py::test_training_step_*`, `bench/bench_bwd.py`.
+- Public API: `prefix_sliding_attention(q, k, v, ..., return_lse=False)`, a
+  `torch.library` custom op pair with fake impls and registered autograd; `opcheck` and
+  `torch.compile(fullgraph=True)` tests pass. The LSE gradient is supported for free
+  (`delta -= dLSE`). Deterministic (no atomics; bitwise-repeatable test).
+- Qwen2.5-1.5B training step, per-parameter gradient error vs an **fp64** eager reference:
+  fp32 kernel median 9.0e-5 vs eager fp32 9.6e-5 (worst param 2x eager); bf16 kernel
+  median 0.16 vs eager bf16 0.98 (6x better).
+- **Numerics lessons** (Qwen2.5 layer 0 has attention scores ~2.4e4, sink rows one-hot):
+  1. Don't rebuild P from a rounded fp32 LSE (~1e-3 error at that size): the forward
+     saves `stats = (raw row max M, log2 l)` and the backward uses
+     `P = exp2((s - M) * scale*log2e - log2 l)`.
+  2. Subtract *before* scaling: `exp2(s*scale - M')` lets the compiler fuse the multiply
+     into an FMA, leaking the product's rounding (~1e-3) into the exponent; P_sink
+     came out as 0.99956 instead of 1. (Triton 3.10 will default FP fusion *off*;
+     the subtract-first form is correct either way.)
+  3. The fp32 *reference* had the same flaw (exp(s - lse)); `attention_ref` now uses
+     exp(s - max)/sum. Random-input tests could not see any of this (fp32 noise on
+     near-tied rows is as large); `test_attention_sink_rows_are_exactly_one_hot` can.
+  4. Kept FlashAttention's `delta = rowsum(dO * O)` with the stored (bf16) O. Exact
+     delta needs an extra K/V pass (~+30%). Bf16 tolerance adopted FA's `+0.3` atol floor
+     for gradients that are small by cancellation.
+- **Performance:** the first backward was ~27x the forward because of **register spills**
+  (RDNA duplicates matrix operands across half-waves; at D=128 every config spills and
+  tile shape matters up to 40x). After a tile sweep plus transposed loads in dK/dV
+  (in-register `tl.trans` in dQ was faster), fwd+bwd at 16k is 162 ms vs 3.4 s for
+  dense causal SDPA and 1.8 s for flex (2.4–3.5 effective TFLOP/s; ROCm's SDPA backward
+  reaches ~0.9). bwd/fwd ratio ~6.5x vs ~2.5x on NVIDIA FA2, so revisit in M6.
+  Load imbalance (prefix tiles do O(N) work) turned out to be minor (P=0 only 10% faster).
+- Gotchas: Inductor/AOTAutograd disk caches (`/tmp/torchinductor_$USER`) are **not keyed
+  on custom-op schema changes**. After changing an op signature, delete that directory
+  or compiled graphs call the op with stale arguments. `validate_layout` must stay pure
+  Python for int arguments (tensor `.any()` branching breaks `fullgraph`). The ROCm
+  PyTorch profiler records no kernel events; time kernels by swapping launches for no-ops.
+
 ---
 
 ## Milestone 4 — Decode and cache (fast inference)
@@ -215,6 +286,39 @@ doubles decode memory traffic. Replace with a preallocated layout:
 **Exit:** with the ring cache, per-token latency is flat for generation lengths
 past P+W (the paper's Fig. 6 shape); faster than sdpa over the evicted cache;
 `generate()` outputs match `tests/test_qwen25.py`.
+
+**Status: done.** `src/prefix/kernels/decode.py`, `src/prefix/modeling/{cache,triton_attention,decoding}.py`,
+`install(model, cfg, backend="triton")`, tests `tests/kernels/test_decode.py`, `tests/test_ring_cache.py`,
+`tests/test_triton_backend.py`, `tests/test_qwen25.py::test_*ring*`, `bench/bench_decode.py`.
+- **Ring cache**: slot = `a` (prefix) or `P + (a-P) % R`, `R = W-1+max_chunk`; a `positions[slot]`
+  tensor replaces any head pointer. Chunks <= `max_chunk` are written in place (`index_copy_`);
+  bigger ones (the prompt) return the M1 contiguous evicted layout for the prefill kernel. The
+  fast path uses device-side counters, so it is graph-capturable. Property-tested against
+  `PrefixSlidingCache` (fp64 attention equality on random schedules); mutation-checked.
+- **Decode kernel**: masks on per-slot positions, so slot order is irrelevant. GQA group packed
+  into the M tile; split-KV whose partials carry raw max + row sum (exact merge at huge scores).
+  Also serves Q <= 16 (speculative decoding / small chunks) with the causal mask.
+- **Kernel bench** (Hq=12, Hkv=2, D=128, P=128, one token; per layer):
+  W=512: 48 us vs 69 us SDPA; W=2k: 69 vs 201; W=8k: 152 vs 717; W=32k: 485 vs 2800.
+  Cache update: ring 27 us flat vs `torch.cat` 73 us (W=512) to 1.5 ms (W=32k).
+- **End to end** (Qwen2.5-1.5B shapes, 4 layers / vocab 4096 so attention matters, W=2048,
+  12k tokens): ring+Triton flat at 11.4 ms/token from the start; evict+SDPA plateaus at
+  14.4; full attention grows 11.2 -> 15.8. At full size (28 layers) a step is bound by memory
+  bandwidth (~85 ms, 3 GB of weights per token) and attention is a small share at 2k tokens.
+- Real Qwen2.5-1.5B: teacher-forced and `generate` through the ring cache + decode kernel
+  pass the same KL / argmax-or-tie checks as the reference paths.
+- **Host overhead lessons**: an `int` per-sequence arg became a 20 us host->device copy per
+  call; 1-element broadcasts cost copies too (now stride-0 args + memoized tensors). Triton's
+  Python launch path costs ~40 us with 31 args (the binder: 18 us) vs ~6 us launching the
+  `CompiledKernel` directly. Per call 97 -> 57 us; caching compiled kernels is an M6 option.
+- **Graphs** (`GraphedDecoder`, `greedy_generate`): work and match eager bit for bit, but
+  **ROCm 7.2.4 segfaults when replaying any graph after ~30-50k kernel launches** (pure PyTorch
+  graphs too; env knobs don't help; re-instantiation doesn't fix it, a fresh capture does).
+  The decoder re-captures on HIP every `8192 // nodes` replays. Graphs gain nothing for
+  1.5B here (bandwidth-bound), so `greedy_generate` enables them by default only on CUDA.
+- Bugs caught: a 1-element `q_start` / `kv_len` tensor with batch > 1 was read out of bounds
+  (now broadcast via stride 0, wrong shapes raise, regression test). The slow path returned
+  one key more than needed (tightened after a mutation survived).
 
 ---
 
@@ -255,6 +359,35 @@ Per-family features, added in this order, each behind a constexpr flag (zero cos
 Integration tests: run the same tiny-random-weight equivalence test
 (kernel backend vs eager + explicit mask) across Qwen2, Qwen3, Llama, Mistral,
 Gemma2, Phi3. This catches family-specific kwargs early.
+
+**Status: Qwen family + the latent-reasoning sketch done; other families deferred.**
+`src/prefix/modeling/integration.py`, `tests/test_integration.py`, kernel bias tests in
+`tests/kernels/test_{fwd,bwd,decode}.py`.
+- `enable_prefix_sliding(model, cfg, backend="triton"|"mask")` / `disable_prefix_sliding`
+  for `qwen2` (incl. Qwen2.5), `qwen3`, `qwen2_moe`, `qwen3_moe`. State is **per model**
+  (registry keyed by the config's id, not stashed on the config, which would leak into
+  `save_pretrained`). Mechanism: the model's modeling module's `create_causal_mask` is
+  wrapped once (pass-through for models that aren't enabled) and returns a descriptor for
+  enabled models. That gives the attention function the cache object, which the ring
+  cache needs. `monkeypatch.install/uninstall` are now thin wrappers;
+  `triton_attention.py` was folded in.
+- Others raise `NotImplementedError`: DeepSeek (MLA), Gemma (softcap, hybrid sliding),
+  gpt-oss (sinks), Llama / Mistral, multimodal Qwen (mRoPE), Qwen3-Next / 3.5 (hybrid
+  linear attention), and models with native sliding layers.
+  Gotcha: Qwen2-MoE builds the sliding-window mask even when no layer uses it; for
+  enabled models that builder now returns `None`.
+- **Relative-bias profile** (new kernel feature, for `docs/transformer.py`'s `RelBias`):
+  `rel_bias [B, H, Nq, E]`, and pair (q, k) gets `rel_bias[..., q_row, q_pos - k_pos]` when
+  `0 <= q_pos - k_pos < E` (absolute positions, so it works with eviction and ring
+  caches). Supported in the forward, backward (dQ writes `d_rel_bias` with plain stores,
+  since each (row, distance) is one key, so no atomics) and decode kernels, plus the
+  custom op (opcheck + `fullgraph` compile tested). The bias is divided by `scale` once
+  outside the kernels, so in-kernel it is a plain add (no multiply for the compiler to fuse
+  differently in the forward and backward). The `T x T` bias is never materialized.
+  Helpers: `relative_bias_profile`, `block_attention` (drop-in for the sketch's attention),
+  `attend` / `attend_cached`, `config_from_latent_cfg`. Tested against the sketch's own
+  math (fp64): profile == `RelBias` exactly, trunk outputs and every parameter gradient
+  (incl. `r_proj`, `bias_bank`), and incremental decoding with ring / eviction caches.
 
 ---
 
