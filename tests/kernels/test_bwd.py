@@ -15,15 +15,17 @@ import math
 
 import pytest
 import torch
+import triton
+import triton.language as tl
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from prefix.kernels.bwd import DKDV_CONFIGS, DQ_CONFIGS, prefix_sliding_attention_bwd
+from prefix.kernels.bwd import DKDV_CONFIGS, DQ_CONFIGS, prefix_sliding_attention_bwd, q_tile_range
 from prefix.kernels.fwd import config_dict, prefix_sliding_attention_fwd
 from prefix.kernels.ops import _attention, prefix_sliding_attention
-from prefix.kernels.reference import attention_ref
-from prefix.kernels.strategies import KINDS, AttnShape, attn_shapes, examples
-from prefix.kernels.testing import CASES, AttnCase, assert_close_to_ref, make_inputs, max_abs_err
+from prefix.kernels.reference import _cdiv, attention_ref, q_block_range
+from prefix.kernels.strategies import KINDS, AttnShape, TileConfig, attn_shapes, examples, layouts
+from prefix.kernels.testing import CASES, PADDED_CASES, AttnCase, assert_close_to_ref, make_inputs, max_abs_err
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
@@ -167,9 +169,10 @@ def _inputs(s: AttnShape, dtype):
     return tuple(t.to("cuda", dtype) for t in (q, k, v))
 
 
-def _draw(data, kinds, max_len, head_dims):
+def _draw(data, kinds, max_len, head_dims, padded=False):
     bm, bn, warps = data.draw(st.sampled_from(FORCED_CONFIGS), label="config")
-    s = data.draw(attn_shapes(kinds=kinds, max_len=max_len, head_dims=head_dims, blocks=(bm, bn)), label="shape")
+    shapes = attn_shapes(kinds=kinds, max_len=max_len, head_dims=head_dims, blocks=(bm, bn), padded=padded)
+    s = data.draw(shapes, label="shape")
     c = _cfg(bm, bn, warps)
     return s, dict(fwd_cfg=c, dkdv=c, dq=c)
 
@@ -246,7 +249,7 @@ def test_opcheck() -> None:
     E = torch.zeros(B, dtype=torch.int32, device="cuda")
     qs = torch.zeros(B, dtype=torch.int32, device="cuda")
     q, k, v = (t.requires_grad_(True) for t in (q, k, v))
-    torch.library.opcheck(_attention, (q, k, v, P, E, qs, kw["window_size"], 0.125))
+    torch.library.opcheck(_attention, (q, k, v, P, E, qs, qs, kw["window_size"], 0.125))
 
 
 def test_stats_fallback_matches() -> None:
@@ -399,7 +402,7 @@ def test_rel_bias_public_op_bf16_and_opcheck() -> None:
     B = q.shape[0]
     P = torch.as_tensor(kw["prefix_length"], device="cuda").to(torch.int32).expand(B).contiguous()
     z = torch.zeros(B, dtype=torch.int32, device="cuda")
-    torch.library.opcheck(_attention, (*leaves[:3], P, z, z, kw["window_size"], 0.125, leaves[3]))
+    torch.library.opcheck(_attention, (*leaves[:3], P, z, z, z, kw["window_size"], 0.125, leaves[3]))
 
 
 def test_rel_bias_torch_compile_fullgraph() -> None:
@@ -415,3 +418,236 @@ def test_rel_bias_torch_compile_fullgraph() -> None:
     compiled = torch.autograd.grad(torch.compile(loss_fn, fullgraph=True)(*leaves), leaves)
     for a, b in zip(eager, compiled):
         torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+
+# --------------------------------------------------------------------------
+# left padding (kv_start)
+# --------------------------------------------------------------------------
+
+
+def _pad_masks(kw, B: int, q_len: int, kv_len: int, device="cuda"):
+    """``(pad_q [B, Nq], pad_k [B, Nk])``: queries / stored keys before kv_start."""
+    from prefix.kernels.reference import default_q_start, key_positions, query_positions
+
+    P, E = kw["prefix_length"], kw.get("num_evicted", 0)
+    qs = kw.get("q_start")
+    qs = default_q_start(q_len, kv_len, P, E) if qs is None else qs
+    S = torch.as_tensor(kw.get("kv_start", 0), device=device).reshape(-1, 1)
+    qpos = query_positions(q_len, torch.as_tensor(qs, device=device), device).expand(B, -1)
+    kpos = key_positions(kv_len, torch.as_tensor(P, device=device), torch.as_tensor(E, device=device), device)
+    return qpos < S, kpos.expand(B, -1) < S
+
+
+@pytest.mark.parametrize("case", PADDED_CASES, ids=str)
+def test_padded_cases_bf16(case: AttnCase) -> None:
+    q, k, v, kw = make_inputs(case, dtype=torch.bfloat16, device="cuda")
+    _check_low_precision(q, k, v, kw, case.name)
+
+
+@pytest.mark.parametrize("case", PADDED_CASES, ids=str)
+def test_padded_cases_fp32_with_dlse(case: AttnCase) -> None:
+    """dLSE on pad rows (whose lse is -inf) must not leak into any gradient."""
+    q, k, v, kw = make_inputs(case, dtype=torch.float32, device="cuda")
+    c = _cfg(32, 32, 4)
+    _check_fp32(q, k, v, kw, case.name, with_dlse=True, fwd_cfg=c, dkdv=c, dq=c)
+
+
+@pytest.mark.parametrize("config", FORCED_CONFIGS, ids=lambda c: f"bm{c[0]}_bn{c[1]}")
+def test_padding_residue_sweep(config) -> None:
+    """S at every residue mod BLOCK_N / BLOCK_M (batched per sequence): inside
+    the prefix (P = S + p), past the prefix, and with eviction in the gap /
+    tail. Hits the all-pad key tile, the straddling tile and the dK/dV
+    q-range arithmetic at each alignment."""
+    bm, bn, warps = config
+    c = _cfg(bm, bn, warps)
+    g = torch.Generator().manual_seed(0)
+    S = torch.arange(0, 2 * bn + bm + 2)
+    B = len(S)
+    for W in (1, bn + 2, bm + bn):
+        n = 3 * bm + 2 * bn + W + 3
+        q, k, v = (torch.randn(B, 2, n, 16, generator=g).cuda() for _ in range(3))
+        for P in (S, S + 3, torch.full_like(S, bn + 1)):
+            kw = dict(prefix_length=P, window_size=W, kv_start=S)
+            _check_fp32(q, k, v, kw, f"train W={W} P={P.tolist()}", fwd_cfg=c, dkdv=c, dq=c)
+        p, E, q_len = bn + 1, bn + 3, bm + 3
+        kv_len = p + W - 1 + q_len
+        q = torch.randn(B, 2, q_len, 16, generator=g).cuda()
+        k, v = (torch.randn(B, 2, kv_len, 16, generator=g).cuda() for _ in range(2))
+        for shift in (0, p + E - 3):
+            kw = dict(prefix_length=p, window_size=W, num_evicted=E, kv_start=S + shift)
+            _check_fp32(q, k, v, kw, f"evicted W={W} S+{shift}", fwd_cfg=c, dkdv=c, dq=c)
+
+
+@settings(max_examples=examples(0.5))
+@given(st.data(), st.booleans())
+def test_padded_random_layouts_fp32(data, with_dlse: bool) -> None:
+    s, cfgs = _draw(data, KINDS, 150, (16, 32), padded=True)
+    q, k, v = _inputs(s, torch.float32)
+    _check_fp32(q, k, v, s.layout.ref_kwargs(), str(s), with_dlse=with_dlse, **cfgs)
+
+
+@settings(max_examples=examples(0.25))
+@given(st.data())
+def test_padded_random_layouts_bf16(data) -> None:
+    s, cfgs = _draw(data, KINDS, 150, (64,), padded=True)
+    q, k, v = _inputs(s, torch.bfloat16)
+    _check_low_precision(q, k, v, s.layout.ref_kwargs(), str(s), **cfgs)
+
+
+@settings(max_examples=examples(0.25))
+@given(st.data(), st.integers(1, 70))
+def test_padded_rel_bias_grads_random_fp32(data, E: int) -> None:
+    s, cfgs = _draw(data, KINDS, 120, (16,), padded=True)
+    q, k, v = _inputs(s, torch.float32)
+    bias = torch.randn(*q.shape[:3], E, generator=torch.Generator().manual_seed(s.seed)).cuda()
+    kw = s.layout.ref_kwargs()
+    do, _ = _upstream(q)
+    got = _bias_kernel_grads(q, k, v, bias, kw, do, c=cfgs["fwd_cfg"])
+    ref = _bias_grads_ref(q, k, v, bias, kw, do)
+    for nm, g, r in zip(("dq", "dk", "dv", "dbias"), got, ref):
+        bound = FP32_RTOL * max(1.0, r.abs().max().item())
+        assert max_abs_err(g, r) <= bound, f"{s} E={E} {nm}"
+
+
+@settings(max_examples=examples(0.25))
+@given(st.data(), st.sampled_from([torch.float32, torch.bfloat16]), st.booleans())
+def test_pad_grads_are_exactly_zero_and_finite(data, dtype, use_stats: bool) -> None:
+    """Pad queries: dQ = 0 and d_rel_bias = 0; pad keys: dK = dV = 0; no NaN
+    anywhere, with huge scores, a dLSE on every row (incl. lse = -inf ones)
+    and with / without the forward's stats (the fallback rebuilds M from
+    lse = -inf, which must not give exp(-inf - -inf))."""
+    s, cfgs = _draw(data, KINDS, 80, (16,), padded=True)
+    q, k, v = _inputs(s, dtype)
+    q = q * 30
+    kw = s.layout.ref_kwargs()
+    lay = s.layout
+    bias = torch.randn(*q.shape[:3], 9, generator=torch.Generator().manual_seed(s.seed)).cuda()
+    do, dlse = _upstream(q, with_dlse=True)
+    c = cfgs["fwd_cfg"]
+    out, lse, stats = prefix_sliding_attention_fwd(q, k, v, **kw, rel_bias=bias, config=c, return_stats=True)
+    dq, dk, dv, dbias = prefix_sliding_attention_bwd(
+        do, q, k, v, out, lse, **kw, dlse=dlse, stats=stats if use_stats else None, rel_bias=bias,
+        config_dkdv=c, config_dq=c,
+    )  # fmt: skip
+    assert all(torch.isfinite(g).all() for g in (dq, dk, dv, dbias)), str(s)
+    _, ref_lse = attention_ref(q, k, v, **kw)
+    empty = torch.isneginf(ref_lse)  # pad queries and any other empty row
+    pad_q, pad_k = _pad_masks(kw, s.batch, lay.q_len, lay.kv_len)
+    assert empty[pad_q.unsqueeze(1).expand_as(empty)].all()
+    assert (dq[empty] == 0).all() and (dbias[empty] == 0).all()
+    pad_k = pad_k.unsqueeze(1).expand(dk.shape[:3])
+    assert (dk[pad_k] == 0).all() and (dv[pad_k] == 0).all()
+
+
+@pytest.mark.parametrize("name", ["pad_train", "pad_train_per_seq", "pad_chunk_q16"])
+def test_padded_batch_equals_unpadded_rows(name: str) -> None:
+    """Acceptance: each row of a left-padded batch has the gradients (incl.
+    d_rel_bias) of that row run unpadded, and zero gradients on its pads."""
+    case = next(c for c in PADDED_CASES if c.name == name)
+    q, k, v, kw = make_inputs(case, dtype=torch.float32, device="cuda")
+    bias = torch.randn(*q.shape[:3], 40, generator=torch.Generator().manual_seed(7)).cuda()
+    do, _ = _upstream(q)
+    grads = _bias_kernel_grads(q, k, v, bias, kw, do)
+    S, P, E = (torch.as_tensor(kw[x]).expand(case.batch) for x in ("kv_start", "prefix_length", "num_evicted"))
+    train = case.q_len == case.kv_len
+    for b in range(case.batch):
+        s = int(S[b])
+        rows = slice(s, None) if train else slice(None)
+        sl_q, sl_k = (slice(b, b + 1), slice(None), rows), (slice(b, b + 1), slice(None), slice(s, None))
+        kw_b = dict(prefix_length=int(P[b]) - s, num_evicted=int(E[b]), window_size=case.window_size)
+        ref = _bias_kernel_grads(q[sl_q], k[sl_k], v[sl_k], bias[sl_q], kw_b, do[sl_q])
+        for nm, g, r, sl in zip(("dq", "dk", "dv", "dbias"), grads, ref, (sl_q, sl_k, sl_k, sl_q)):
+            bound = FP32_RTOL * max(1.0, r.abs().max().item())
+            assert max_abs_err(g[sl], r) <= bound, f"{name} row {b} {nm}"
+        assert (grads[1][b, :, :s] == 0).all() and (grads[2][b, :, :s] == 0).all()
+        if train:
+            assert (grads[0][b, :, :s] == 0).all() and (grads[3][b, :, :s] == 0).all()
+
+
+@pytest.mark.parametrize("name", ["pad_train_per_seq", "pad_chunk_q16", "pad_train_all_rows"])
+def test_padded_public_op_autotuned(name: str) -> None:
+    case = next(c for c in PADDED_CASES if c.name == name)
+    q, k, v, kw = make_inputs(case, dtype=torch.bfloat16, device="cuda")
+    do, dlse = _upstream(q, with_dlse=True)
+    qg, kg, vg = (t.detach().requires_grad_(True) for t in (q, k, v))
+    out, lse = prefix_sliding_attention(qg, kg, vg, **kw, return_lse=True)
+    ((out * do).sum() + (lse.masked_fill(torch.isinf(lse), 0) * dlse).sum()).backward()
+    ref = _ref_grads(q, k, v, kw, do, dlse)
+    base = _ref_grads(q, k, v, kw, do, dlse, compute_dtype=q.dtype)
+    for nm, g, r, b in zip(("dq", "dk", "dv"), (qg.grad, kg.grad, vg.grad), ref, base):
+        assert torch.isfinite(g).all(), f"{name} {nm}"
+        assert_close_to_ref(g, r, b, what=f"{name} {nm}")
+
+
+def test_padded_opcheck() -> None:
+    case = next(c for c in PADDED_CASES if c.name == "pad_train_per_seq")
+    q, k, v, kw = make_inputs(case, dtype=torch.bfloat16, device="cuda")
+    B = q.shape[0]
+    i32 = lambda x: torch.as_tensor(x, device="cuda").to(torch.int32).expand(B).contiguous()  # noqa: E731
+    z = i32(0)
+    bias = torch.randn(*q.shape[:3], 16, generator=torch.Generator().manual_seed(4)).cuda()
+    leaves = [t.detach().requires_grad_(True) for t in (q, k, v, bias)]
+    args = (*leaves[:3], i32(kw["prefix_length"]), z, z, i32(kw["kv_start"]), kw["window_size"], 0.125)
+    torch.library.opcheck(_attention, args)
+    torch.library.opcheck(_attention, (*args, leaves[3]))
+
+
+def test_padded_torch_compile_no_recompile() -> None:
+    """kv_start is a tensor input: changing it must not recompile, and the
+    compiled graph's gradients equal eager's."""
+    case = next(c for c in PADDED_CASES if c.name == "pad_train_per_seq")
+    q, k, v, kw = make_inputs(case, dtype=torch.bfloat16, device="cuda")
+    bias = torch.randn(*q.shape[:3], 24, generator=torch.Generator().manual_seed(5)).cuda()
+    do, _ = _upstream(q)
+
+    def loss_fn(q, k, v, b, P, S):
+        return (prefix_sliding_attention(q, k, v, prefix_length=P, kv_start=S, window_size=case.window_size,
+                                         rel_bias=b) * do).sum()  # fmt: skip
+
+    compiled = torch.compile(loss_fn, fullgraph=True)
+    for S in ([63, 64, 65], [0, 7, 180], [0, 0, 0]):
+        S = torch.tensor(S, device="cuda")
+        P = S + 31
+        leaves = [t.detach().requires_grad_(True) for t in (q, k, v, bias)]
+        eager = torch.autograd.grad(loss_fn(*leaves, P, S), leaves)
+        with torch._dynamo.config.patch(error_on_recompile=S.sum().item() != 192):  # first call compiles
+            got = torch.autograd.grad(compiled(*leaves, P, S), leaves)
+        for a, b in zip(eager, got):
+            torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+
+# --------------------------------------------------------------------------
+# the dK/dV kernel's query-tile range == reference.q_block_range
+# --------------------------------------------------------------------------
+
+
+@triton.jit
+def _q_range_probe(Out, qs, P, E, S, W, Nq, Nk, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+    n = tl.program_id(0)
+    m_lo, m_hi = q_tile_range(n, qs, P, E, S, W, Nq, Nk, BLOCK_M, BLOCK_N)
+    tl.store(Out + 2 * n, m_lo)
+    tl.store(Out + 2 * n + 1, m_hi)
+
+
+@st.composite
+def _kernel_tile_configs(draw):
+    bm, bn = draw(st.sampled_from([(16, 16), (32, 16), (16, 32), (64, 32)]))
+    return TileConfig(draw(layouts(blocks=(bm, bn), max_len=150, padded=True)), bm, bn)
+
+
+@settings(max_examples=examples(2))
+@given(_kernel_tile_configs())
+def test_q_tile_range_mirrors_reference(cfg: TileConfig) -> None:
+    """Exactly the reference's query tiles per key tile (that plan is proven
+    exact in test_block_ranges.py). Output checks can't see a key tile of
+    pure padding looping over query tiles under the mask, only this can."""
+    lay, bm, bn = cfg.layout, cfg.block_m, cfg.block_n
+    n_n = _cdiv(lay.kv_len, bn)
+    out = torch.empty(n_n, 2, dtype=torch.int32, device="cuda")
+    _q_range_probe[(n_n,)](
+        out, lay.q_start, lay.prefix_length, lay.num_evicted, lay.kv_start, lay.window_size, lay.q_len, lay.kv_len,
+        BLOCK_M=bm, BLOCK_N=bn,
+    )  # fmt: skip
+    for n, (lo, hi) in enumerate(out.tolist()):
+        ref = list(q_block_range(n, **cfg.kwargs()))
+        assert list(range(lo, hi)) == ref, f"n={n}: kernel [{lo}, {hi}) != reference {ref}"

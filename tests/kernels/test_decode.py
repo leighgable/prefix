@@ -220,3 +220,101 @@ def test_rel_bias(name, E, splits) -> None:
     ref, ref_lse = attention_ref_positions(q, k, v, q_positions=torch.arange(n0, n0 + Q)[None],
                                            k_positions=pos[None], prefix_length=P, window_size=W, rel_bias=bias)  # fmt: skip
     assert max_abs_err(out, ref) < 4 * FP32_ATOL and max_abs_err(lse, ref_lse) < 4 * FP32_ATOL
+
+
+# --------------------------------------------------------------------------
+# left padding (kv_start)
+# --------------------------------------------------------------------------
+
+
+@st.composite
+def padded_ring_problems(draw):
+    """A padded batch in the ring cache's layout: prefix slots P + max(S) shared
+    by every row, per-row S_b and attention prefix P_b = S_b + P."""
+    P, W, chunk = draw(st.integers(0, 30)), draw(st.integers(1, 80)), draw(st.integers(1, 16))
+    B = draw(st.integers(1, 3))
+    Q = draw(st.integers(1, chunk))
+    n_before = draw(st.integers(0, 300))
+    end = n_before + Q
+    s_val = st.one_of(st.just(0), st.integers(0, 40), st.just(end), st.integers(max(0, end - 3), end + 2))
+    return dict(
+        P=P, W=W, chunk=chunk, Q=Q, n_before=n_before, B=B, S=draw(st.lists(s_val, min_size=B, max_size=B)),
+        Hkv=draw(st.integers(1, 2)), group=draw(st.sampled_from([1, 2, 6])), D=draw(st.sampled_from([16, 32])),
+        splits=draw(st.sampled_from([1, 2, 3, None])), block_n=draw(st.sampled_from([16, 64])),
+        shuffle=draw(st.booleans()), bias=draw(st.one_of(st.none(), st.integers(1, 60))),
+        seed=draw(st.integers(0, 2**16)),
+    )  # fmt: skip
+
+
+@settings(max_examples=examples(0.5))
+@given(padded_ring_problems())
+def test_padded_ring_layouts_fp32(c) -> None:
+    """Per-row kv_start and prefix over shared slots (S up to past every query:
+    pad queries are empty rows), any slot order, with and without split-KV and
+    a relative bias."""
+    S = torch.tensor(c["S"])
+    pos = ring_positions(c["P"] + int(S.max()), c["W"], c["chunk"], c["n_before"] + c["Q"])
+    if c["shuffle"]:
+        pos = pos[torch.randperm(pos.numel(), generator=torch.Generator().manual_seed(c["seed"]))]
+    q, k, v = _inputs(c["B"], c["Hkv"] * c["group"], c["Hkv"], c["Q"], pos.numel(), c["D"], torch.float32, c["seed"])
+    bias = None
+    if c["bias"] is not None:
+        bias = torch.randn(*q.shape[:3], c["bias"], generator=torch.Generator().manual_seed(c["seed"])).cuda()
+    kw = dict(prefix_length=S + c["P"], window_size=c["W"])
+    out, lse = prefix_sliding_decode(
+        q, k, v, k_positions=pos.cuda(), q_start=c["n_before"], kv_start=S.cuda(), num_splits=c["splits"],
+        block_n=c["block_n"], rel_bias=bias, **kw,
+    )  # fmt: skip
+    qpos = torch.arange(c["Q"])[None] + c["n_before"]
+    ref, ref_lse = attention_ref_positions(q, k, v, q_positions=qpos, k_positions=pos[None], kv_start=S,
+                                           rel_bias=bias, **kw)  # fmt: skip
+    assert max_abs_err(out, ref) < 4 * FP32_ATOL and max_abs_err(lse, ref_lse) < 4 * FP32_ATOL
+    empty = torch.isneginf(ref_lse)
+    assert torch.equal(torch.isneginf(lse), empty) and (out[empty] == 0).all()
+    assert not out.isnan().any() and not lse.isnan().any()
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=str)
+@pytest.mark.parametrize("name", ["decode_steady", "decode_warmup", "spec_q5", "chunk_q16", "hd80"])
+def test_padded_cases(name, dtype) -> None:
+    """The fixed cases as a padded batch: prefix slots grow by max(S)."""
+    _, B, Hq, Hkv, Q, D, P, W, chunk, n0 = _case(name)
+    B = 3
+    S = torch.tensor([0, 9, min(31, n0)])
+    pos = ring_positions(P + int(S.max()), W, chunk, n0 + Q)
+    q, k, v = _inputs(B, Hq, Hkv, Q, pos.numel(), D, dtype)
+    kw = dict(prefix_length=S + P, window_size=W)
+    out, lse = prefix_sliding_decode(q, k, v, k_positions=pos.cuda(), q_start=n0, kv_start=S.cuda(), **kw)
+    qpos = torch.arange(Q)[None] + n0
+    ref, ref_lse = attention_ref_positions(q, k, v, q_positions=qpos, k_positions=pos[None], kv_start=S, **kw)
+    if dtype == torch.float32:
+        assert max_abs_err(out, ref) < FP32_ATOL and max_abs_err(lse, ref_lse) < FP32_ATOL
+    else:
+        base, base_lse = attention_ref_positions(q, k, v, q_positions=qpos, k_positions=pos[None], kv_start=S,
+                                                 compute_dtype=dtype, **kw)  # fmt: skip
+        assert_close_to_ref(out, ref, base, what=f"{name} out")
+        assert_close_to_ref(lse, ref_lse, base_lse, what=f"{name} lse")
+
+
+def test_padded_row_equals_unpadded_row() -> None:
+    """Acceptance: a padded row's decode output == the same row decoded alone
+    without padding (positions shifted by S, prefix P)."""
+    P, W, chunk, n_real, Q = 7, 24, 4, 60, 2
+    S = 13
+    g = torch.Generator().manual_seed(3)
+    pos_pad = ring_positions(P + S, W, chunk, S + n_real + Q)
+    pos = ring_positions(P, W, chunk, n_real + Q)
+    # the same tokens: position a (unpadded) <-> a + S (padded)
+    by_pos = {a: torch.randn(2, 32, generator=g) for a in range(n_real + Q)}
+    junk = lambda: torch.randn(2, 32, generator=g)  # noqa: E731  pads / empty slots
+
+    def fill(positions, shift):
+        return torch.stack([by_pos.get(int(a) - shift, junk()) if a >= 0 else junk() for a in positions], 1)[None]
+
+    k_pad, k = fill(pos_pad, S).cuda(), fill(pos, 0).cuda()
+    v_pad, v = (k_pad * 0.5 + 1).cos(), (k * 0.5 + 1).cos()
+    q = torch.randn(1, 6, Q, 32, generator=g).cuda()
+    out_pad, lse_pad = prefix_sliding_decode(q, k_pad, v_pad, k_positions=pos_pad.cuda(), prefix_length=P + S,
+                                             window_size=W, q_start=S + n_real, kv_start=S)  # fmt: skip
+    out, lse = prefix_sliding_decode(q, k, v, k_positions=pos.cuda(), prefix_length=P, window_size=W, q_start=n_real)
+    assert max_abs_err(out_pad, out) < FP32_ATOL and max_abs_err(lse_pad, lse) < FP32_ATOL

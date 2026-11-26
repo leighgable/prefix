@@ -102,10 +102,14 @@ def _dispatch(query, keys, values, *, config, cache, layer_idx, num_evicted, sca
                 raise RuntimeError("the ring-cache decode path is inference-only; use no cache to train")
             out, _ = prefix_sliding_decode(
                 query, keys, values, k_positions=layer.positions, prefix_length=layer.prefix, window_size=W,
-                q_start=layer.q_start, kv_len=layer.kv_len, scale=scale, rel_bias=rel_bias,
+                q_start=layer.q_start, kv_len=layer.kv_len, kv_start=layer.kv_start, scale=scale, rel_bias=rel_bias,
             )  # fmt: skip
             return out
-        num_evicted = layer.last_layout.num_evicted
+        layout = layer.last_layout  # contiguous; carries the kernel arguments (padding-aware)
+        return prefix_sliding_attention(
+            query, keys, values, prefix_length=P if layout.prefix_length is None else layout.prefix_length,
+            window_size=W, num_evicted=layout.num_evicted, kv_start=layout.kv_start, scale=scale, rel_bias=rel_bias,
+        )  # fmt: skip
     return prefix_sliding_attention(
         query, keys, values, prefix_length=P, window_size=W, num_evicted=num_evicted, scale=scale, rel_bias=rel_bias
     )

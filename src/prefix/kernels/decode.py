@@ -6,7 +6,9 @@ For a few new queries (decode: 1; speculative decoding / small chunks: up to
 (the cache already holds only prefix + window), it takes an explicit absolute
 position per slot (``-1`` = empty) and masks on positions:
 
-    allowed(q, k) = k >= 0 and k <= q and (k < P or k > q - W)
+    allowed(q, k) = k >= max(S, 0) and k <= q and (k < P or k > q - W)
+
+with ``S = kv_start`` (left padding; default 0).
 
 For single-token decode after eviction every valid slot is allowed, so the
 slot order is irrelevant (attention is permutation-invariant over keys).
@@ -39,14 +41,15 @@ LN2 = 0.6931471805599453
 
 
 @triton.jit(do_not_specialize=["Hkv", "GROUP", "Q_LEN", "W", "keys_per_split", "stride_pb",
-                               "stride_qs", "stride_pre", "stride_kvl", "stride_bb", "stride_bh", "stride_bm", "REL_E"])
+                               "stride_qs", "stride_pre", "stride_kvl", "stride_ks", "stride_bb", "stride_bh",
+                               "stride_bm", "REL_E"])
 def _decode_fwd(
-    Q, K, V, KPos, QStart, Prefix, KvLen, Bias,
+    Q, K, V, KPos, QStart, Prefix, KvLen, KvStart, Bias,
     Out, Lse, PartO, PartM, PartL,
     stride_qb, stride_qh, stride_qm,
     stride_kb, stride_kh, stride_kn,
     stride_vb, stride_vh, stride_vn,
-    stride_pb, stride_qs, stride_pre, stride_kvl,  # per-sequence arrays; stride 0 = shared
+    stride_pb, stride_qs, stride_pre, stride_kvl, stride_ks,  # per-sequence arrays; stride 0 = shared
     stride_ob, stride_oh, stride_om,
     stride_bb, stride_bh, stride_bm, REL_E,
     Hkv, GROUP, Q_LEN, W, qk_scale, keys_per_split,
@@ -62,6 +65,7 @@ def _decode_fwd(
     P = tl.load(Prefix + b * stride_pre)
     q0 = tl.load(QStart + b * stride_qs)
     kv_len = tl.load(KvLen + b * stride_kvl)
+    k_lo = tl.maximum(tl.load(KvStart + b * stride_ks), 0)  # first real position: empty (-1) and pads below
 
     # rows = (group head g, query m) pairs of this kv-head
     rows = tl.arange(0, BLOCK_M)
@@ -99,7 +103,7 @@ def _decode_fwd(
             dist = q_abs[:, None] - k_abs[None, :]
             in_rng = (dist >= 0) & (dist < REL_E) & (k_abs >= 0)[None, :] & valid_row[:, None]
             qk += tl.load(bias_rows[:, None] + dist, mask=in_rng, other=0.0).to(tl.float32)
-        allowed = (k_abs[None, :] >= 0) & (k_abs[None, :] <= q_abs[:, None]) & (
+        allowed = (k_abs[None, :] >= k_lo) & (k_abs[None, :] <= q_abs[:, None]) & (
             (k_abs[None, :] < P) | (k_abs[None, :] > q_abs[:, None] - W)
         )
         qk = tl.where(allowed, qk, float("-inf"))
@@ -202,6 +206,7 @@ def prefix_sliding_decode(
     window_size: int,
     q_start: IntOrTensor,
     kv_len: IntOrTensor | None = None,
+    kv_start: IntOrTensor = 0,
     scale: float | None = None,
     num_splits: int | None = None,
     block_n: int = 64,
@@ -218,6 +223,9 @@ def prefix_sliding_decode(
         q_start, prefix_length: int or per-sequence ``[B]`` tensor.
         kv_len: only the first ``kv_len`` slots are scanned (default: all S).
             Pass a device tensor to keep the call free of host syncs.
+        kv_start: int or per-sequence ``[B]`` tensor; slots holding positions
+            below it (left padding) are never attended, and queries before it
+            give out 0 / lse -inf.
         num_splits: split-KV factor (default: ``choose_num_splits``).
         rel_bias: optional relative-bias profile ``[B, Hq, Q, E]`` (natural
             units) for the new queries, indexed by ``q_pos - k_pos``.
@@ -243,6 +251,7 @@ def prefix_sliding_decode(
     stride_pb = 0 if kpos.ndim == 1 else kpos.stride(0)
     (P_t, s_pre), (qs_t, s_qs) = _seq_arg(prefix_length, B, dev), _seq_arg(q_start, B, dev)
     kv_len_t, s_kvl = _seq_arg(S if kv_len is None else kv_len, B, dev)
+    ks_t, s_ks = _seq_arg(kv_start, B, dev)
     scale = 1.0 / math.sqrt(D) if scale is None else scale
     qk_scale = scale * LOG2E
 
@@ -263,12 +272,12 @@ def prefix_sliding_decode(
     else:
         part_o = part_m = part_l = lse  # unused
     _decode_fwd[(B * Hkv, splits)](
-        q, k, v, kpos, qs_t, P_t, kv_len_t, bias_raw,
+        q, k, v, kpos, qs_t, P_t, kv_len_t, ks_t, bias_raw,
         out, lse, part_o, part_m, part_l,
         q.stride(0), q.stride(1), q.stride(2),
         k.stride(0), k.stride(1), k.stride(2),
         v.stride(0), v.stride(1), v.stride(2),
-        stride_pb, s_qs, s_pre, s_kvl,
+        stride_pb, s_qs, s_pre, s_kvl, s_ks,
         out.stride(0), out.stride(1), out.stride(2),
         *bias_strides, rel_e,
         Hkv, group, Q_len, int(window_size), qk_scale, keys_per_split,

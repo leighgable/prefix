@@ -1,6 +1,6 @@
 # Handoff: padding support (`kv_start`) in the prefix sliding kernels
 
-Status: **milestones 1–2 done** (see "Progress" at the end).
+Status: **milestones 1–4 done** (see "Progress" at the end).
 Originally: Written at the end of a session in the llung
 repo (`~/Code/llung`), which consumes this repo for `LatentLM`'s
 attention. Decisions below are made — implement, don't re-litigate.
@@ -189,9 +189,8 @@ Run the relevant tests after each one, and the full suite at the end.
   `prefix_sliding_attention_fwd(..., kv_start=0)`. NaN guards were already
   there (`m_safe`, the `empty` epilogue). Pad rows give out 0, lse -inf,
   stats `M = +inf`, `log2 l = 0`.
-- `bwd.py` `_bwd_dq` calls the new `kv_tile_ranges` with `S = P * 0` and
-  loops `[a_start, a_end)`. **Milestone 3 must load the real `S` there**
-  (marked `TODO(milestone 3)`), plus `S` in `_allowed` / `_bwd_dkdv`.
+- (`bwd.py` `_bwd_dq` was switched to the new `kv_tile_ranges` here with
+  `S = 0`; milestone 3 loads the real `S`.)
 - **Bit-for-bit at S = 0, verified:** fwd (out / lse / stats, split and
   unsplit, ± rel_bias, bf16 + fp32, two forced configs) and bwd
   (dq / dk / dv / dbias) over all `CASES` with D <= 128 (1426 tensors) are
@@ -210,8 +209,97 @@ Run the relevant tests after each one, and the full suite at the end.
   new kernel condition is caught.
 - Baseline is now 533 passed (this env; cold autotune took 18 min).
 
-- **llung env:** 12 `tests/test_integration.py` cache tests (the `ring` /
-  `eviction` caches and `generate`) already fail **at HEAD `21e053b`**
-  (torch 2.15.0, transformers 5.24.1 there, vs 5.22.2 here). That's
-  unrelated to padding, but it blocks the "green in llung's env"
-  acceptance; look at it before/with milestone 4.
+**Milestone 3 (backward + custom ops): done.**
+- `bwd.py`: `_allowed(..., S)` masks pad keys in both kernels. New
+  `q_tile_range(...)` jit helper (mirrors `reference.q_block_range`:
+  `c0 = max(c0, s_0)`, and an all-pad key tile (`c0 >= c1`) visits no query
+  tile, so dK = dV = 0 without any work). `_bwd_dq` loads `S` (`KvStart`
+  after `QStart` in both kernels) and loops `[a_start, a_end)`.
+  `prefix_sliding_attention_bwd(..., kv_start=0)`. No new NaN guards were
+  needed: empty rows have `M = +inf` (from the stats, or the stats-free
+  fallback that rebuilds `M` from `lse = -inf`), so `P = exp2(-inf) = 0`, and
+  `dS = P * (dP - delta) = 0` even with a dLSE on those rows.
+- `ops.py`: `kv_start: Tensor` (int32 `[B]`, non-differentiable) after
+  `q_start` in both `prefix_sliding::attention` and `::attention_backward`
+  (schema, fake impls, `_setup_context`, `_backward` -> None);
+  `prefix_sliding_attention(..., kv_start=0)` (an int `kv_start < 0`
+  raises; tensors aren't validated, to avoid a sync).
+  **Positional op signature changed**: `_attention(q, k, v, P, E, q_start,
+  kv_start, W, scale[, rel_bias])`.
+- **Bit-for-bit at S = 0, verified** again: the same 1426 tensors (fwd and
+  dq / dk / dv / dbias) are `torch.equal` to the pre-padding HEAD `8c43ed9`.
+  The fwd+bwd bench at S = 0 is unchanged within noise (~±5%).
+- Tests (`test_bwd.py`, "left padding" section): `PADDED_CASES` bf16 and
+  fp32 + dLSE, a padding residue sweep, padded random layouts (fp32 ± dLSE,
+  bf16, rel_bias grads), pad grads exactly 0 and finite (huge scores, dLSE
+  on every row, with / without stats), padded batch == each row unpadded
+  (dq / dk / dv / d_rel_bias), the public op autotuned (incl. an all-pad
+  row), opcheck with kv_start (± rel_bias), torch.compile fullgraph with
+  changing S and `error_on_recompile`, and
+  `test_q_tile_range_mirrors_reference` (probe kernel vs the reference).
+  A mutation check of each new kernel condition is caught.
+- Baseline is now 564 passed (this env).
+
+**Milestone 4 (decode + ring cache): done.**
+- `decode.py`: `prefix_sliding_decode(..., kv_start=0)` (int or `[B]`,
+  stride-0 broadcast like the other per-sequence args); the mask's lower
+  bound is `max(S, 0)` (empty slots are -1). Bit-for-bit at S = 0 (264
+  decode outputs incl. split-KV and rel_bias are `torch.equal` to HEAD);
+  decode bench unchanged.
+- `cache.py` `PrefixSlidingRingLayer` / `PrefixSlidingRingCache`:
+  - `set_kv_start(S)` (int or `[B]`, before the first update or after
+    `reset()`; one host read). All zeros = no padding (`kv_start_host is
+    None`, the old code paths exactly).
+  - Slots: permanent prefix region `slot_prefix = P + max(S)`, then the
+    ring, so `capacity = P + max(S) + W - 1 + max_chunk`. Positions stay
+    absolute and are shared by the batch.
+  - `layer.prefix` (`S + P`) and `layer.kv_start` are now always `[B]`
+    int32 device tensors, written in place (`_write_row_state`), so the
+    fast path stays graph-capturable. Same `max(S)` and batch after
+    `reset()` + `set_kv_start` keeps every buffer (and a captured graph);
+    a different `max(S)` / batch reallocates on the next update.
+  - Fast path: the decode kernel gets the per-row `prefix` / `kv_start`.
+  - Slow path: `ContiguousLayout(num_evicted, prefix_length, kv_start)`
+    now carries the prefill kernel's arguments. Without a gap: per-row
+    `prefix` / `kv_start` as they are. **With a gap** (the hard case: the
+    kernel's `P` is both the mask's prefix and the gap position, but row
+    b's prefix `S_b + P` differs from the stored region `P + max(S)`), each
+    row is shifted by `d_b = max(S) - S_b` (per-row roll of the prefix
+    region); then every row has prefix `P + max(S)`, kv_start `max(S)` and
+    gap `E_b = tail_lo - (S_b + P)`. Distances (so masks and rel_bias) are
+    unchanged; see the module docstring. No kernel change needed.
+  - `reorder_cache` / `batch_repeat_interleave` / `batch_select_indices`
+    also reindex the per-row padding.
+- `integration._dispatch` consumes `layer.kv_start` (decode) and the
+  layout's kernel arguments (slow path). (Public `kv_start` arguments on
+  `attend` / `attend_cached` / `block_attention` / the HF path: milestone 5.
+  For now the cache's padding is set with `cache.set_kv_start(S)`.)
+- Tests: decode kernel with padded ring layouts (hypothesis: per-row S up
+  to past every query, shuffled slots, splits, rel_bias), padded fixed
+  cases bf16 / fp32, padded row == unpadded row; ring cache vs full
+  recompute in fp64 (`test_padded_ring_matches_full_recompute`: ~88% of
+  examples hit the fast path, ~58% the slow path without a gap, ~24% the
+  shifted gap layout, counted with `event()`), a deterministic shifted-layout
+  check, the `set_kv_start` API; `tests/test_padded_decoding.py`: a toy
+  LatentLM-shaped model (rel_bias, no RoPE) generating through
+  `attend_cached`: padded batch == each row alone (greedy tokens exact),
+  == full recompute, graph replay == eager, all-pad rows NaN-free. A
+  mutation check of each new piece (roll direction, E_b, gap kv_start,
+  pad slots, decode mask, both dispatch paths) is caught.
+- Baseline is now 583 passed (this env).
+- **For milestone 5:** (a) `GraphedDecoder` fills `position_ids` with the
+  cache length for every row; with left padding HF's position ids are
+  per row (`N - S_b`). (b) `PrefixSlidingCache` (eviction) still keeps
+  `[0, P)` ++ tail; with padding it would need `P + max(S)` and the same
+  shifted layout (or the Triton path should reject it).
+
+**llung env failures: resolved by pinning llung to transformers 5.22.2**
+(`transformers==5.22.2` in llung's `pyproject.toml` / `uv.lock`, same as
+this repo). With that, the llung-env check is fully green (532 passed,
+incl. all of `test_integration.py`; llung's own suite too). Cause, for
+when we upgrade: transformers 5.24 renamed `create_causal_mask`'s argument
+`past_key_values` -> `cache` (the old name is keyword-only), and
+`integration._patch_module` reads `arguments.get("past_key_values")` (None
+on 5.24), so cached forwards were treated as uncached and the mask backend
+never saw the eviction cache. Fix then:
+`arguments.get("cache", arguments.get("past_key_values"))`.

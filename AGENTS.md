@@ -20,7 +20,8 @@
 
 - Full suite: `python -m pytest -q -p no:cacheprovider` (baseline:
   480 passed). Kernels only: `tests/kernels/`.
-- **Also check llung's env** (torch 2.15.0, the consumer; there `prefix`
+- **Also check llung's env** (torch 2.15.0; transformers pinned to 5.22.2
+  like here, since 5.24 renamed an argument our mask patch reads; the consumer; there `prefix`
   is normally the pinned flake copy, so override it with the working tree):
   ```
   cd ~/Code/llung && eval "$(direnv export bash 2>/dev/null)" && cd ~/Code/prefix

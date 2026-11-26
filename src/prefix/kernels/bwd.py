@@ -27,6 +27,10 @@ forward) and the scale is applied after the subtraction, so FMA contraction
 cannot leak the product's rounding error into the exponent. Rows with no
 allowed key have ``M = +inf``, so their P (and every gradient term) is 0.
 
+Left padding (``kv_start`` = S): pad keys are masked (``_allowed``) and key
+tiles holding only pad keys visit no query tile, so dK = dV = 0 there; pad
+queries are empty rows (above), so dQ = 0 and d_rel_bias = 0 on them.
+
 All tiles are masked here (no full/edge split): on this GPU the forward split
 gained ~0% and the backward is dominated by its four dots per tile. Performance
 is dominated by register pressure; see the config notes below.
@@ -40,7 +44,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .fwd import LOG2E, _bias_arg, _n_bucket, _per_seq, kv_tile_ranges
+from .fwd import LOG2E, _bias_arg, _n_bucket, _per_seq, first_at_or_after, kv_tile_ranges
 from .reference import IntOrTensor, default_q_start, validate_layout
 
 # --------------------------------------------------------------------------
@@ -73,9 +77,9 @@ def _bwd_preprocess(
 
 
 @triton.jit
-def _allowed(k_abs, q_abs, P, W):
-    """Mask for broadcastable absolute key / query positions."""
-    return (k_abs <= q_abs) & ((k_abs < P) | (k_abs > q_abs - W))
+def _allowed(k_abs, q_abs, P, W, S):
+    """Mask for broadcastable absolute key / query positions (S = kv_start)."""
+    return (k_abs >= S) & (k_abs <= q_abs) & ((k_abs < P) | (k_abs > q_abs - W))
 
 
 @triton.jit
@@ -84,12 +88,28 @@ def _probs(s, row_max, row_log2_sum, qk_scale):
     return tl.math.exp2((s - row_max) * qk_scale - row_log2_sum)
 
 
+@triton.jit
+def q_tile_range(n_block, qs, P, E, S, W, Nq, Nk, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+    """Query tiles ``[m_lo, m_hi)`` that see key tile ``n_block`` (dK/dV pass).
+    Mirrors ``reference.q_block_range`` (checked against it in
+    ``tests/kernels/test_bwd.py::test_q_tile_range_mirrors_reference``)."""
+    c0 = tl.maximum(n_block * BLOCK_N, first_at_or_after(S, P, E))  # the tile's first real key
+    c1 = tl.minimum(n_block * BLOCK_N + BLOCK_N, Nk)
+    k_min = c0 + E * (c0 >= P).to(tl.int32)
+    k_max = (c1 - 1) + E * ((c1 - 1) >= P).to(tl.int32)
+    row_hi = tl.where(c0 < P, Nq, tl.minimum(Nq, k_max + W - qs))
+    row_lo = tl.maximum(0, k_min - qs)
+    m_lo = row_lo // BLOCK_M
+    m_hi = tl.where((c0 < c1) & (row_lo < row_hi), tl.cdiv(row_hi, BLOCK_M), m_lo)  # all-pad tile: none
+    return m_lo, m_hi
+
+
 _NO_SPEC = ["GROUP", "Nq", "Nk", "W", "N_BUCKET", "stride_lb", "stride_lh", "stride_bb", "stride_bh", "stride_bm", "REL_E"]
 
 
 @triton.jit(do_not_specialize=["Hkv"] + _NO_SPEC)
 def _bwd_dkdv(
-    Q, K, V, DO, RowMax, RowLog2Sum, Delta, DK, DV, Prefix, Evicted, QStart, Bias,
+    Q, K, V, DO, RowMax, RowLog2Sum, Delta, DK, DV, Prefix, Evicted, QStart, KvStart, Bias,
     stride_qb, stride_qh, stride_qm,
     stride_kb, stride_kh, stride_kn,
     stride_vb, stride_vh, stride_vn,
@@ -111,6 +131,7 @@ def _bwd_dkdv(
     P = tl.load(Prefix + b)
     E = tl.load(Evicted + b)
     qs = tl.load(QStart + b)
+    S = tl.load(KvStart + b)
 
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, HEAD_DIM_PAD)
@@ -121,15 +142,7 @@ def _bwd_dkdv(
     v = tl.load(V + b * stride_vb + kvh * stride_vh + offs_n[:, None] * stride_vn + offs_d[None, :], mask=kv_mask, other=0.0)
     k_abs = offs_n + E * (offs_n >= P).to(tl.int32)
 
-    # ---- query tiles that see this key tile: mirrors reference.q_block_range ----
-    c0 = pid_n * BLOCK_N
-    c1 = tl.minimum(c0 + BLOCK_N, Nk)
-    k_min = c0 + E * (c0 >= P).to(tl.int32)
-    k_max = (c1 - 1) + E * ((c1 - 1) >= P).to(tl.int32)
-    row_hi = tl.where(c0 < P, Nq, tl.minimum(Nq, k_max + W - qs))
-    row_lo = tl.maximum(0, k_min - qs)
-    m_lo = row_lo // BLOCK_M
-    m_hi = tl.where(row_lo < row_hi, tl.cdiv(row_hi, BLOCK_M), m_lo)
+    m_lo, m_hi = q_tile_range(pid_n, qs, P, E, S, W, Nq, Nk, BLOCK_M, BLOCK_N)
 
     dk = tl.zeros([BLOCK_N, HEAD_DIM_PAD], dtype=tl.float32)
     dv = tl.zeros([BLOCK_N, HEAD_DIM_PAD], dtype=tl.float32)
@@ -161,7 +174,7 @@ def _bwd_dkdv(
                 in_rng = (dist_t >= 0) & (dist_t < REL_E) & in_m[None, :] & in_n[:, None]
                 s_t += tl.load(bias_base + offs_m[None, :] * stride_bm + dist_t, mask=in_rng, other=0.0).to(tl.float32)
             p_t = _probs(s_t, row_max[None, :], row_l2[None, :], qk_scale)
-            allowed = _allowed(k_abs[:, None], (qs + offs_m)[None, :], P, W) & in_n[:, None] & in_m[None, :]
+            allowed = _allowed(k_abs[:, None], (qs + offs_m)[None, :], P, W, S) & in_n[:, None] & in_m[None, :]
             p_t = tl.where(allowed, p_t, 0.0)
             dv = tl.dot(p_t.to(do.dtype), do, dv, input_precision=DOT_PRECISION)
             dp_t = tl.dot(v, do_t, input_precision=DOT_PRECISION)  # [BN, BM]
@@ -179,7 +192,7 @@ def _bwd_dkdv(
 def _dq_tiles(
     dq, q, do, row_max, row_l2, delta, q_abs, in_m,
     k_base, v_base, stride_kn, stride_vn, offs_d, in_d,
-    lo, hi, P, E, W, Nk, qk_scale,
+    lo, hi, P, E, S, W, Nk, qk_scale,
     bias_rows, dbias_rows, REL_E,
     BLOCK_N: tl.constexpr, DOT_PRECISION: tl.constexpr, HAS_BIAS: tl.constexpr,
 ):  # fmt: skip
@@ -200,7 +213,7 @@ def _dq_tiles(
             in_rng = (dist >= 0) & (dist < REL_E) & in_m[:, None] & in_n[None, :]
             s += tl.load(bias_rows[:, None] + dist, mask=in_rng, other=0.0).to(tl.float32)
         p = _probs(s, row_max[:, None], row_l2[:, None], qk_scale)
-        allowed = _allowed(k_abs[None, :], q_abs[:, None], P, W) & in_n[None, :] & in_m[:, None]
+        allowed = _allowed(k_abs[None, :], q_abs[:, None], P, W, S) & in_n[None, :] & in_m[:, None]
         p = tl.where(allowed, p, 0.0)
         dp = tl.dot(do, v_t, input_precision=DOT_PRECISION)  # [BM, BN]
         ds = p * (dp - delta[:, None])
@@ -214,7 +227,7 @@ def _dq_tiles(
 
 @triton.jit(do_not_specialize=["Hq"] + _NO_SPEC)
 def _bwd_dq(
-    Q, K, V, DO, RowMax, RowLog2Sum, Delta, DQ, Prefix, Evicted, QStart, Bias, DBias,
+    Q, K, V, DO, RowMax, RowLog2Sum, Delta, DQ, Prefix, Evicted, QStart, KvStart, Bias, DBias,
     stride_qb, stride_qh, stride_qm,
     stride_kb, stride_kh, stride_kn,
     stride_vb, stride_vh, stride_vn,
@@ -236,6 +249,7 @@ def _bwd_dq(
     P = tl.load(Prefix + b)
     E = tl.load(Evicted + b)
     qs = tl.load(QStart + b)
+    S = tl.load(KvStart + b)
 
     row_lo = pid_m * BLOCK_M
     offs_m = row_lo + tl.arange(0, BLOCK_M)
@@ -252,16 +266,15 @@ def _bwd_dq(
     q_abs = qs + offs_m
     bias_off = b * stride_bb + h * stride_bh + offs_m * stride_bm  # Bias and DBias share a layout
 
-    S = P * 0  # TODO(milestone 3): load kv_start
     a_start, a_end, b_start, b_end = kv_tile_ranges(row_lo, qs, P, E, S, W, Nq, Nk, BLOCK_M, BLOCK_N)
     k_base = K + b * stride_kb + kvh * stride_kh
     v_base = V + b * stride_vb + kvh * stride_vh
     dq = tl.zeros([BLOCK_M, HEAD_DIM_PAD], dtype=tl.float32)
     dq = _dq_tiles(dq, q, do, row_max, row_l2, delta, q_abs, in_m, k_base, v_base, stride_kn, stride_vn, offs_d, in_d,
-                   a_start, a_end, P, E, W, Nk, qk_scale, Bias + bias_off, DBias + bias_off, REL_E,
+                   a_start, a_end, P, E, S, W, Nk, qk_scale, Bias + bias_off, DBias + bias_off, REL_E,
                    BLOCK_N, DOT_PRECISION, HAS_BIAS)  # fmt: skip
     dq = _dq_tiles(dq, q, do, row_max, row_l2, delta, q_abs, in_m, k_base, v_base, stride_kn, stride_vn, offs_d, in_d,
-                   b_start, b_end, P, E, W, Nk, qk_scale, Bias + bias_off, DBias + bias_off, REL_E,
+                   b_start, b_end, P, E, S, W, Nk, qk_scale, Bias + bias_off, DBias + bias_off, REL_E,
                    BLOCK_N, DOT_PRECISION, HAS_BIAS)  # fmt: skip
     dq = dq * sm_scale
     tl.store(DQ + b * stride_dqb + h * stride_dqh + offs_m[:, None] * stride_dqm + offs_d[None, :],
@@ -321,6 +334,7 @@ def prefix_sliding_attention_bwd(
     window_size: int,
     q_start: IntOrTensor | None = None,
     num_evicted: IntOrTensor = 0,
+    kv_start: IntOrTensor = 0,
     scale: float | None = None,
     dlse: torch.Tensor | None = None,
     stats: torch.Tensor | None = None,
@@ -340,14 +354,17 @@ def prefix_sliding_attention_bwd(
 
     With ``rel_bias`` (the forward's natural-unit profile ``[B, Hq, Nq, E]``)
     returns ``(dq, dk, dv, d_rel_bias)``; ``d_rel_bias`` is float32.
+
+    ``kv_start`` must be the forward's: pad keys get dK = dV = 0, pad queries
+    dQ = 0 and d_rel_bias = 0.
     """
     B, Hq, Nq, D = q.shape
     Hkv, Nk = k.shape[1], k.shape[2]
     if q_start is None:
-        validate_layout(Nq, Nk, prefix_length, window_size, num_evicted)
+        validate_layout(Nq, Nk, prefix_length, window_size, num_evicted, kv_start)
         q_start = default_q_start(Nq, Nk, prefix_length, num_evicted)
     dev = q.device
-    P_t, E_t, qs_t = (_per_seq(x, B, dev) for x in (prefix_length, num_evicted, q_start))
+    P_t, E_t, qs_t, S_t = (_per_seq(x, B, dev) for x in (prefix_length, num_evicted, q_start, kv_start))
     scale = 1.0 / math.sqrt(D) if scale is None else scale
     q, k, v, out, do = (_unit_last(t) for t in (q, k, v, out, do))
     lse = lse.contiguous()
@@ -378,7 +395,7 @@ def prefix_sliding_attention_bwd(
     common = (Nq, Nk, int(window_size), scale, scale * LOG2E, _n_bucket(Nq))
     meta = dict(HEAD_DIM=D, HEAD_DIM_PAD=head_pad, DOT_PRECISION="ieee", HAS_BIAS=rel_bias is not None)
     dkdv_args = (
-        q, k, v, do, stats[0], stats[1], delta, dk, dv, P_t, E_t, qs_t, bias_raw,
+        q, k, v, do, stats[0], stats[1], delta, dk, dv, P_t, E_t, qs_t, S_t, bias_raw,
         q.stride(0), q.stride(1), q.stride(2),
         k.stride(0), k.stride(1), k.stride(2),
         v.stride(0), v.stride(1), v.stride(2),
@@ -390,7 +407,7 @@ def prefix_sliding_attention_bwd(
         Hkv, group, *common,
     )  # fmt: skip
     dq_args = (
-        q, k, v, do, stats[0], stats[1], delta, dq, P_t, E_t, qs_t, bias_raw, dbias,
+        q, k, v, do, stats[0], stats[1], delta, dq, P_t, E_t, qs_t, S_t, bias_raw, dbias,
         q.stride(0), q.stride(1), q.stride(2),
         k.stride(0), k.stride(1), k.stride(2),
         v.stride(0), v.stride(1), v.stride(2),
