@@ -35,22 +35,16 @@ device counter (``next_pos``) and keeps the decode kernel's scalars
 captured decode step stays correct on every replay. Host-side counters are
 advanced by ``PrefixSlidingRingCache.advance`` (see ``prefix.modeling.decoding``).
 
-Left padding (``set_kv_start(S)``, before the first update): row ``b`` holds
-pads at positions ``[0, S_b)`` and its prefix is ``[S_b, S_b + P)``, so the
-per-row attention prefix is ``P_b = S_b + P`` and keys below ``S_b`` are
-masked (``kv_start``). The slots are shared by the batch, so the permanent
-prefix region grows to ``P + max(S)`` slots; the per-row masks do the rest.
-On the fast path the decode kernel takes per-row ``prefix`` / ``kv_start``
-tensors. The slow path's contiguous layout needs one gap position for the
-whole batch, but row ``b``'s prefix ends at ``P_b`` while the stored prefix
-region ends at ``P + max(S)``. Once there is a gap, each row is shifted right
-by ``d_b = max(S) - S_b`` (a per-row roll of the prefix region; positions
-become ``a + d_b``). Distances are unchanged, so the mask and any relative
-bias are too, and every row then has prefix ``P + max(S)``, padding bound
-``max(S)`` and its own gap ``E_b = tail_lo - P_b`` (``ContiguousLayout``
-carries these kernel arguments). Row ``b``'s tokens in ``[P_b, P + max(S))``
-drop out of that layout: a gap means they are older than every query's
-window, so no query can see them.
+Left padding (``set_kv_start(S, prefix_length)``, before the first update):
+row ``b``'s positions ``[0, S_b)`` are pads (masked: ``kv_start``) and its
+prefix is ``[0, P_b)`` in absolute positions (``prefix_length``: per row,
+default the config's P; the Hugging Face integration passes ``S + P``). The
+slots are shared by the batch, so the permanent prefix region is
+``max(P_b)`` slots; the per-row masks do the rest. The fast path hands the
+decode kernel per-row ``prefix`` / ``kv_start`` device tensors. The slow
+path's contiguous layout needs one gap position for the whole batch; with a
+gap, rows are shifted to share it (``monkeypatch.padded_layout``), and
+``ContiguousLayout`` carries the resulting kernel arguments.
 """
 
 from __future__ import annotations
@@ -61,7 +55,7 @@ from functools import partial
 import torch
 from transformers.cache_utils import Cache, CacheLayerMixin
 
-from .monkeypatch import PrefixSlidingConfig
+from .monkeypatch import LeftPadding, PrefixSlidingConfig, padded_layout
 
 
 @dataclass(frozen=True)
@@ -101,51 +95,46 @@ class PrefixSlidingRingLayer(CacheLayerMixin):
         self.ring = config.window_size - 1 + max_chunk
         self.cumulative_length = 0
         self.last_layout: RingLayout | ContiguousLayout | None = None
-        self.kv_start_host: torch.Tensor | None = None  # [B] int64 on the CPU; None = no padding
-        self._set_pad_slots(0)
+        self.padding: LeftPadding | None = None
+        self._set_slot_prefix(config.prefix_length)
 
-    def _set_pad_slots(self, pad_slots: int) -> None:
-        self.pad_slots = pad_slots  # max(S): extra permanent prefix slots for left padding
-        self.slot_prefix = self.prefix_length + pad_slots  # slots [0, slot_prefix) are never overwritten
+    def _set_slot_prefix(self, slot_prefix: int) -> None:
+        self.slot_prefix = slot_prefix  # slots [0, slot_prefix) are never overwritten
         self.capacity = self.slot_prefix + self.ring
 
     # -- left padding ---------------------------------------------------------
 
-    def set_kv_start(self, kv_start) -> None:
-        """Left padding for the next sequence: row ``b``'s first ``kv_start[b]``
-        positions are pads (int or ``[B]``; all zeros = no padding). Call before
-        the first ``update`` (or after ``reset``). Reads ``kv_start`` on the host
-        (one sync for a device tensor). Keeps the buffers (and any captured
-        graph) when the batch size and ``max(S)`` are unchanged; otherwise they
-        are reallocated on the next update."""
+    def set_kv_start(self, kv_start, prefix_length=None) -> None:
+        """Left padding for the next sequence (see ``LeftPadding``): row ``b``'s
+        positions ``[0, kv_start[b])`` are pads; its prefix is ``[0,
+        prefix_length[b])`` (absolute; default the config's P). Ints or ``[B]``.
+        Call before the first ``update`` (or after ``reset``); reads the values
+        on the host (one sync for device tensors). Keeps the buffers (and any
+        captured graph) when the batch size and ``max(prefix_length)`` are
+        unchanged; otherwise they are reallocated on the next update."""
         if self.cumulative_length:
             raise RuntimeError("set_kv_start must be called before the first update (or after reset())")
-        S = torch.as_tensor(kv_start).detach().to("cpu", torch.long).reshape(-1)
-        if (S < 0).any():
-            raise ValueError(f"kv_start must be >= 0, got {S.tolist()}")
-        S = S if bool(S.any()) else None
-        pad = int(S.max()) if S is not None else 0
+        padding = LeftPadding.make(kv_start, prefix_length, self.prefix_length)
+        slot_prefix = padding.store_prefix if padding is not None else self.prefix_length
         if self.is_initialized:
-            B = self.keys.shape[0]
-            if pad != self.pad_slots or (S is not None and S.numel() not in (1, B)):
+            rows = padding.kv_start.numel() if padding is not None else 1
+            if slot_prefix != self.slot_prefix or rows not in (1, self.keys.shape[0]):
                 self.is_initialized = False  # reallocate (capacity / batch changed)
-        self.kv_start_host = S
-        self._set_pad_slots(pad)
+        self.padding = padding
+        self._set_slot_prefix(slot_prefix)
         if self.is_initialized:
             self._write_row_state()
 
     def _write_row_state(self) -> None:
-        """Per-row ``kv_start`` / attention prefix ``S + P`` into the (fixed) device tensors."""
+        """Per-row ``kv_start`` / prefix into the (fixed) device tensors."""
         B = self.keys.shape[0]
-        S = self.kv_start_host
-        if S is None:
-            S = torch.zeros(B, dtype=torch.long)
-        elif S.numel() == 1:
-            S = S.expand(B)
-        elif S.numel() != B:
-            raise ValueError(f"kv_start has {S.numel()} rows, the batch has {B}")
-        self.kv_start.copy_(S)
-        self.prefix.copy_(S + self.prefix_length)
+        if self.padding is None:
+            self.kv_start.zero_()
+            self.prefix.fill_(self.prefix_length)
+        else:
+            S, P = self.padding.rows(B)
+            self.kv_start.copy_(S)
+            self.prefix.copy_(P)
 
     # -- allocation ---------------------------------------------------------
 
@@ -161,7 +150,7 @@ class PrefixSlidingRingLayer(CacheLayerMixin):
         self.next_pos = torch.zeros(1, dtype=torch.long, device=self.device)  # next write position
         self.q_start = torch.zeros(1, dtype=torch.int32, device=self.device)
         self.kv_len = torch.zeros(1, dtype=torch.int32, device=self.device)
-        # per row: attention prefix S_b + P and padding bound S_b (fixed after set_kv_start)
+        # per row: prefix P_b and padding bound S_b (written in place by set_kv_start)
         self.prefix = torch.empty(B, dtype=torch.int32, device=self.device)
         self.kv_start = torch.empty(B, dtype=torch.int32, device=self.device)
         self.is_initialized = True
@@ -203,24 +192,19 @@ class PrefixSlidingRingLayer(CacheLayerMixin):
         tail_lo = max(P, N - self.window_size + 1)  # oldest key the chunk's first query sees
         tail_slots = self._slots(torch.arange(tail_lo, N, device=self.device)) if tail_lo < N else None
         gap = tail_lo - P if N >= P else 0
-        if self.kv_start_host is None:
-            pre_k, pre_v = self.keys[:, :, :n_pre], self.values[:, :, :n_pre]
-            self.last_layout = ContiguousLayout(num_evicted=gap)
-        elif gap == 0:  # contiguous positions: per-row prefix / kv_start apply as they are
-            pre_k, pre_v = self.keys[:, :, :n_pre], self.values[:, :, :n_pre]
-            self.last_layout = ContiguousLayout(num_evicted=0, prefix_length=self.prefix, kv_start=self.kv_start)
-        else:  # shift row b by d_b so all rows share the gap position (module docstring)
-            d = (self.pad_slots - self.kv_start).long()  # [B]
-            idx = (torch.arange(P, device=self.device)[None] - d[:, None]) % P  # [B, P]; wrapped = masked junk
-            pre_k = self.keys[:, :, :P].gather(2, idx[:, None, :, None].expand(-1, self.keys.shape[1], -1, self.keys.shape[3]))
-            pre_v = self.values[:, :, :P].gather(2, idx[:, None, :, None].expand(-1, self.values.shape[1], -1, self.values.shape[3]))
-            self.last_layout = ContiguousLayout(num_evicted=tail_lo - self.prefix, prefix_length=P, kv_start=self.pad_slots)
-        parts_k, parts_v = [pre_k], [pre_v]
+        parts_k, parts_v = [self.keys[:, :, :n_pre]], [self.values[:, :, :n_pre]]
         if tail_slots is not None:
             parts_k.append(self.keys.index_select(2, tail_slots))
             parts_v.append(self.values.index_select(2, tail_slots))
         full_k = torch.cat([*parts_k, key_states], dim=-2)
         full_v = torch.cat([*parts_v, value_states], dim=-2)
+        if self.padding is None:
+            self.last_layout = ContiguousLayout(num_evicted=gap)
+        else:
+            full_k, full_v, kw = padded_layout(
+                full_k, full_v, store_prefix=P, prefix=self.prefix, kv_start=self.kv_start, gap=gap
+            )
+            self.last_layout = ContiguousLayout(**kw)
 
         # Store what future queries need: new prefix tokens + the last R new tokens.
         keep = [r for r in (range(N, min(P, N + q_len)), range(max(P, N, N + q_len - R), N + q_len)) if len(r)]
@@ -270,8 +254,8 @@ class PrefixSlidingRingLayer(CacheLayerMixin):
         if self.is_initialized:
             self.keys, self.values = fn(self.keys), fn(self.values)
             self.prefix, self.kv_start = fn(self.prefix), fn(self.kv_start)
-        if self.kv_start_host is not None and self.kv_start_host.numel() > 1:
-            self.kv_start_host = fn(self.kv_start_host.to(self.device)).cpu()
+        if self.padding is not None:
+            self.padding = self.padding.select(lambda t: fn(t.to(self.device)).cpu())
 
     def reorder_cache(self, beam_idx: torch.LongTensor) -> None:
         self._select_rows(lambda t: t.index_select(0, beam_idx.to(t.device)))
@@ -305,21 +289,21 @@ class PrefixSlidingRingCache(Cache):
         for layer in self.layers:
             layer.advance(q_len)
 
-    def set_kv_start(self, kv_start) -> None:
-        """Left padding (``[B]`` pads per row) for the next sequence; see
-        ``PrefixSlidingRingLayer.set_kv_start``. Layers created later inherit it."""
+    def set_kv_start(self, kv_start, prefix_length=None) -> None:
+        """Left padding for the next sequence on every layer (incl. layers
+        created later); see ``PrefixSlidingRingLayer.set_kv_start``."""
         for layer in self.layers:
-            layer.set_kv_start(kv_start)
+            layer.set_kv_start(kv_start, prefix_length)
         if self.layer_class_to_replicate is not None:
-            self.layer_class_to_replicate = partial(_padded_layer, self.config, self.max_chunk, kv_start)
+            self.layer_class_to_replicate = partial(_padded_layer, self.config, self.max_chunk, kv_start, prefix_length)
 
     @property
-    def kv_start(self) -> torch.Tensor | None:
-        """The padding set by ``set_kv_start`` (CPU ``[B]``), or None."""
-        return self.layers[0].kv_start_host if self.layers else None
+    def padding(self) -> LeftPadding | None:
+        """The padding set by ``set_kv_start`` (CPU tensors), or None."""
+        return self.layers[0].padding if self.layers else None
 
 
-def _padded_layer(config: PrefixSlidingConfig, max_chunk: int, kv_start) -> PrefixSlidingRingLayer:
+def _padded_layer(config: PrefixSlidingConfig, max_chunk: int, kv_start, prefix_length) -> PrefixSlidingRingLayer:
     layer = PrefixSlidingRingLayer(config, max_chunk)
-    layer.set_kv_start(kv_start)
+    layer.set_kv_start(kv_start, prefix_length)
     return layer

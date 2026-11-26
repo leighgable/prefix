@@ -87,8 +87,8 @@ def generate(model, ids, kv_start, schedule, max_chunk=3):
     forced chunk (same tokens for every row). Returns (tokens, logits) of
     everything after the prompt."""
     cache = PrefixSlidingRingCache(CFG, max_chunk=max_chunk)
-    if kv_start is not None:
-        cache.set_kv_start(kv_start)
+    if kv_start is not None:  # HF-style: the prefix counts real tokens
+        cache.set_kv_start(kv_start, kv_start + CFG.prefix_length)
     layouts = []
     with torch.no_grad():
         logits = [model(ids, past_key_values=cache).logits]
@@ -146,7 +146,7 @@ def test_padded_graph_replay_equals_eager(model, prompts) -> None:
     out = {}
     for use_graph in (False, True):
         cache = PrefixSlidingRingCache(CFG, max_chunk=1)
-        cache.set_kv_start(S)
+        cache.set_kv_start(S, S + CFG.prefix_length)
         out[use_graph] = greedy_generate(model, ids, cache, max_new_tokens=30, use_graph=use_graph)
     assert torch.equal(out[True], out[False])
     toks, _, _ = generate(model, ids, S, [30], max_chunk=1)

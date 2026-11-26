@@ -1,6 +1,6 @@
 # Handoff: padding support (`kv_start`) in the prefix sliding kernels
 
-Status: **milestones 1–4 done** (see "Progress" at the end).
+Status: **milestones 1–5 done** (see "Progress" at the end).
 Originally: Written at the end of a session in the llung
 repo (`~/Code/llung`), which consumes this repo for `LatentLM`'s
 attention. Decisions below are made — implement, don't re-litigate.
@@ -287,11 +287,71 @@ Run the relevant tests after each one, and the full suite at the end.
   mutation check of each new piece (roll direction, E_b, gap kv_start,
   pad slots, decode mask, both dispatch paths) is caught.
 - Baseline is now 583 passed (this env).
-- **For milestone 5:** (a) `GraphedDecoder` fills `position_ids` with the
-  cache length for every row; with left padding HF's position ids are
-  per row (`N - S_b`). (b) `PrefixSlidingCache` (eviction) still keeps
-  `[0, P)` ++ tail; with padding it would need `P + max(S)` and the same
-  shifted layout (or the Triton path should reject it).
+- (Milestone 5 generalized `set_kv_start`; see below.)
+
+**Milestone 5 (integration): done.**
+- **Prefix semantics** (the one design choice made here):
+  - Below the HF layer everything is *absolute*, as in the kernels:
+    `attend` / `attend_cached` / `block_attention(..., kv_start=S)` keep
+    `config.prefix_length` as an absolute column (pads included). For
+    LatentLM's left-padded questions ending at column `Lq` in every row,
+    that is `prefix_length = Lq` (= `S_b + len(q_b)`), no per-row tensors.
+  - The HF integration counts P in *real* tokens (a system prompt is P
+    tokens wherever the pads end): row b's prefix is `S_b + P`, in both
+    backends (the mask backend's old "pads eat into the prefix" behaviour
+    is gone; it is now a consistent oracle).
+  - Caches: `set_kv_start(kv_start, prefix_length=None)` on both
+    `PrefixSlidingRingCache` and `PrefixSlidingCache` (**changed from
+    milestone 4**: the per-row prefix is now an explicit absolute argument,
+    default the config's P, instead of a hard-coded `S + P`). State is
+    `monkeypatch.LeftPadding` (CPU `[B]` kv_start / prefix); the permanent
+    prefix region is `max(prefix)` slots (ring `slot_prefix`, eviction
+    `store_prefix`).
+- `monkeypatch.padded_layout` is the shared slow-path / eviction helper:
+  with a gap, row b is shifted by `d_b = max(prefix) - prefix_b`, giving
+  prefix `max(prefix)`, kv_start `S_b + d_b`, gap `E + d_b` (generalizes
+  milestone 4's `d_b = max(S) - S_b`). Used by the ring slow path and by
+  the Triton path over `PrefixSlidingCache` (padded eviction cache).
+- `integration`:
+  - `left_padding(mask, validate)`: leading zeros of a 2-D mask (device,
+    no sync); with `validate` (multi-token forwards, one sync as before)
+    raises `NotImplementedError("... only left padding ...")` unless every
+    row is `0...0 1...1`, and returns None when nothing is padded (then the
+    unpadded path runs exactly as before).
+  - `_build_meta`: prefix-sliding caches get the padding at prefill
+    (`set_kv_start(S, S + P)`) and keep it; later multi-token forwards
+    check it is unchanged (ValueError: the prefill must contain all pads,
+    e.g. a chunked prefill whose first chunk ends inside a row's pads);
+    decode steps read the cache (no sync). Other caches / no cache:
+    `PrefixSlidingMeta.kv_start` / `prefix_length` device tensors per
+    forward.
+  - `_dispatch(..., kv_start, prefix_length)`; `hf_attention_forward` passes
+    the meta's. Mask backend: per-row prefix mask fn
+    (`prefix_sliding_mask_function(config, prefix)`,
+    `evicted_cache_mask_function(..., prefix, store_prefix)`), padded
+    eviction cache, `_gather_padding_mask` uses `store_prefix`.
+- `decoding`: `GraphedDecoder` position ids are `N - S_b` per row (as
+  `generate`); `greedy_generate(..., attention_mask=)` for padded prompts.
+- Tests: `test_integration.py` (4 Qwen families, fp32): padded Triton (no
+  cache / ring / eviction / dynamic, incl. the shifted slow path) == mask
+  backend; each padded row == that row alone; mask backend + padded
+  eviction cache; `generate` (Triton ring / Triton eviction / mask
+  eviction) with left padding == each row generated alone, greedy-exact;
+  graph-replayed padded greedy == eager == rows (dense families: MoE
+  routing isn't graph-capturable, skipped); training grads with padding ==
+  mask backend; sketch `block_attention(kv_start)` == rows alone (outputs +
+  grads) and padded incremental decoding (ring / eviction) == full;
+  padding that changes after prefill raises. `test_triton_backend.py`:
+  right padding / gaps raise "only left padding". `test_qwen25.py` (real
+  Qwen2.5, bf16): batched left-padded `generate` (Triton + ring) == each
+  row alone up to bf16 near-ties (2 of 3 rows identical, one diverges at a
+  0.125-logit tie) and == the per-row reference argmax; teacher-forced
+  Triton vs mask backend: padded disagreement <= unpadded (bf16 noise).
+  Note for bf16 references: `GREEDY` has `min_new_tokens`, so `generate`
+  suppresses EOS; compare against EOS-suppressed reference logits.
+- Mutation checks (shift, roll, HF shift, cache shift, mask backend shift,
+  graph positions, sketch kv_start) are all caught.
+- Baseline is now 631 passed + 2 skipped (this env); llung env 599 passed.
 
 **llung env failures: resolved by pinning llung to transformers 5.22.2**
 (`transformers==5.22.2` in llung's `pyproject.toml` / `uv.lock`, same as

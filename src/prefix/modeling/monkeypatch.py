@@ -67,8 +67,97 @@ class PrefixSlidingConfig:
 
     @property
     def max_cached(self) -> int:
-        """Max tokens an eviction cache layer retains between forwards."""
+        """Max tokens an eviction cache layer retains between forwards (no padding)."""
         return self.prefix_length + self.window_size - 1
+
+
+# --------------------------------------------------------------------------
+# Left padding
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class LeftPadding:
+    """Per-row left padding of a cached batch (CPU int64 ``[B]`` or ``[1]``).
+
+    Row ``b``'s positions ``[0, kv_start[b])`` are pads (never attended) and
+    its prefix is ``[0, prefix[b])`` in absolute positions (pads included,
+    then masked), i.e. the kernels' ``prefix_length`` as given. The Hugging Face
+    integration counts P in real tokens and passes ``prefix = kv_start + P``;
+    a model whose prefix ends at the same column in every row (e.g. a
+    left-padded question) passes that column.
+
+    A cache keeps ``store_prefix = max(prefix)`` permanent slots, so every
+    row's prefix is retained.
+    """
+
+    kv_start: torch.Tensor
+    prefix: torch.Tensor
+
+    @classmethod
+    def make(cls, kv_start, prefix_length, default_prefix: int) -> "LeftPadding | None":
+        """None when there is nothing to do (no pads, every prefix the default)."""
+        S = torch.as_tensor(kv_start).detach().to("cpu", torch.long).reshape(-1)
+        P = torch.as_tensor(default_prefix if prefix_length is None else prefix_length)
+        P = P.detach().to("cpu", torch.long).reshape(-1)
+        if S.numel() != P.numel() and 1 not in (S.numel(), P.numel()):
+            raise ValueError(f"kv_start ({S.numel()} rows) and prefix_length ({P.numel()} rows) disagree")
+        S, P = (t.clone() for t in torch.broadcast_tensors(S, P))
+        if (S < 0).any() or (P < 0).any():
+            raise ValueError(f"kv_start / prefix_length must be >= 0, got {S.tolist()} / {P.tolist()}")
+        if not S.any() and bool((P == default_prefix).all()):
+            return None
+        return cls(S, P)
+
+    @property
+    def store_prefix(self) -> int:
+        return int(self.prefix.max())
+
+    def rows(self, batch: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(kv_start, prefix)`` expanded to ``batch`` rows."""
+        if self.kv_start.numel() not in (1, batch):
+            raise ValueError(f"padding has {self.kv_start.numel()} rows, the batch has {batch}")
+        return self.kv_start.expand(batch), self.prefix.expand(batch)
+
+    def select(self, fn) -> "LeftPadding":
+        """Re-index the rows (beam search etc.); ``fn`` maps a ``[B]`` tensor."""
+        if self.kv_start.numel() == 1:
+            return self
+        return LeftPadding(fn(self.kv_start), fn(self.prefix))
+
+
+def _shift_rows(t: torch.Tensor, store_prefix: int, d: torch.Tensor) -> torch.Tensor:
+    """Roll ``t[:, :, :store_prefix]`` right by ``d[b]`` per row (dim 2)."""
+    G = store_prefix
+    idx = (torch.arange(G, device=t.device)[None] - d[:, None]) % G  # [B, G]
+    pre = t[:, :, :G].gather(2, idx[:, None, :, None].expand(-1, t.shape[1], -1, t.shape[3]))
+    return torch.cat([pre, t[:, :, G:]], dim=2)
+
+
+def padded_layout(keys, values, *, store_prefix: int, prefix, kv_start, gap: int):
+    """Kernel arguments for a padded contiguous ``[prefix ++ tail ++ new]`` layout.
+
+    ``keys`` / ``values`` hold ``store_prefix`` prefix entries, then (after a
+    gap of ``gap`` evicted positions) a chronological tail and the new tokens.
+    ``prefix`` / ``kv_start`` are per-row ``[B]`` device tensors. Returns
+    ``(keys, values, kwargs)`` for ``prefix_sliding_attention``.
+
+    No gap: positions are contiguous, the per-row values apply as they are.
+    With a gap the prefill kernel's ``prefix_length`` is both the mask's
+    prefix and the gap position, so every row must share it: row ``b`` is
+    shifted right by ``d_b = store_prefix - prefix_b`` (its stored prefix
+    region rolled; positions become ``a + d_b``). Distances, hence the mask
+    and any relative bias, are unchanged. Each row then has prefix
+    ``store_prefix``, kv_start ``kv_start_b + d_b`` (the ``d_b`` wrapped-around
+    entries in front are masked) and gap ``gap + d_b``. Row ``b``'s entries in
+    ``[prefix_b, store_prefix)`` drop out; with a gap they are older than
+    every query's window, so no query sees them.
+    """
+    if gap == 0:
+        return keys, values, dict(prefix_length=prefix, kv_start=kv_start, num_evicted=0)
+    d = (store_prefix - prefix).long()
+    keys, values = _shift_rows(keys, store_prefix, d), _shift_rows(values, store_prefix, d)
+    return keys, values, dict(prefix_length=store_prefix, kv_start=kv_start + d, num_evicted=gap + d)
 
 
 # --------------------------------------------------------------------------
@@ -76,13 +165,22 @@ class PrefixSlidingConfig:
 # --------------------------------------------------------------------------
 
 
-def prefix_sliding_mask_function(config: PrefixSlidingConfig) -> Callable:
+def prefix_sliding_mask_function(config: PrefixSlidingConfig, prefix: torch.Tensor | None = None) -> Callable:
     """Return a transformers-style mask fn: (b, h, q_idx, kv_idx) -> bool.
 
     It is AND-ed with the causal mask, so it only expresses the "keep" set.
     q_idx / kv_idx are ABSOLUTE positions. Tensor ops only (it gets vmapped).
+    ``prefix``: optional per-row prefix ``[B]`` (device tensor; left padding:
+    ``kv_start + P``) instead of ``config.prefix_length``.
     """
-    P, W = config.prefix_length, config.window_size
+    W = config.window_size
+    if prefix is not None:
+
+        def per_row(batch_idx, head_idx, q_idx, kv_idx):
+            return (kv_idx < prefix[batch_idx]) | (kv_idx > q_idx - W)
+
+        return per_row
+    P = config.prefix_length
 
     def inner(batch_idx, head_idx, q_idx, kv_idx):
         return (kv_idx < P) | (kv_idx > q_idx - W)
@@ -99,16 +197,19 @@ def _stored_to_absolute(kv_idx, prefix_length: int, num_evicted: int):
     return kv_idx + num_evicted * (kv_idx >= prefix_length)
 
 
-def evicted_cache_mask_function(config: PrefixSlidingConfig, num_evicted: int) -> Callable:
+def evicted_cache_mask_function(
+    config: PrefixSlidingConfig, num_evicted: int, prefix: torch.Tensor | None = None, store_prefix: int | None = None
+) -> Callable:
     """Mask fn for a ``PrefixSlidingCache`` whose layers report kv_offset=0.
 
     ``kv_idx`` is a *stored* index. We remap it to absolute and re-apply
     causality there: the stock causal fn compares the stored index (always
     <= absolute) with q_idx, which is strictly looser, so AND-ing with this
-    yields the exact mask.
+    yields the exact mask. With left padding the gap sits after the layer's
+    ``store_prefix`` slots, and ``prefix`` is the per-row prefix.
     """
-    keep = prefix_sliding_mask_function(config)
-    P = config.prefix_length
+    keep = prefix_sliding_mask_function(config, prefix)
+    P = config.prefix_length if store_prefix is None else store_prefix
 
     def inner(batch_idx, head_idx, q_idx, kv_idx):
         abs_kv = _stored_to_absolute(kv_idx, P, num_evicted)
@@ -162,6 +263,30 @@ class PrefixSlidingLayer(DynamicLayer):
         # Total tokens ever seen. get_seq_length() must report this (not the
         # stored length) so position_ids and q_offset keep advancing.
         self.cumulative_length = 0
+        self.padding: LeftPadding | None = None
+        self.store_prefix = config.prefix_length  # permanent prefix entries (max per-row prefix)
+        self._row_tensors = None
+
+    def set_kv_start(self, kv_start, prefix_length=None) -> None:
+        """Left padding for the next sequence (see ``LeftPadding``): call
+        before the first update. ``prefix_length`` (absolute, per row)
+        defaults to the config's P."""
+        if self.cumulative_length:
+            raise RuntimeError("set_kv_start must be called before the first update")
+        self.padding = LeftPadding.make(kv_start, prefix_length, self.prefix_length)
+        self.store_prefix = self.padding.store_prefix if self.padding else self.prefix_length
+        self._row_tensors = None
+
+    def row_tensors(self, batch: int, device) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(kv_start, prefix)`` as int32 ``[B]`` device tensors (padding set)."""
+        if self._row_tensors is None or self._row_tensors[0].device != torch.device(device):
+            S, P = self.padding.rows(batch)
+            self._row_tensors = (S.to(device, torch.int32), P.to(device, torch.int32))
+        return self._row_tensors
+
+    @property
+    def max_cached(self) -> int:
+        return self.store_prefix + self.window_size - 1
 
     @property
     def stored_length(self) -> int:
@@ -184,10 +309,10 @@ class PrefixSlidingLayer(DynamicLayer):
         full_values = torch.cat([self.values, value_states], dim=-2)
 
         total = full_keys.shape[-2]
-        if total > self.config.max_cached:
+        if total > self.max_cached:
             # Prefix is always at the front of storage; the tail is the last
             # W-1 tokens. Explicit start index so W == 1 gives an empty tail.
-            P, start = self.prefix_length, total - (self.window_size - 1)
+            P, start = self.store_prefix, total - (self.window_size - 1)
             self.keys = torch.cat([full_keys[..., :P, :], full_keys[..., start:, :]], dim=-2)
             self.values = torch.cat([full_values[..., :P, :], full_values[..., start:, :]], dim=-2)
         else:
@@ -204,7 +329,7 @@ class PrefixSlidingLayer(DynamicLayer):
         return self.cumulative_length
 
     def get_max_length(self) -> int:
-        return self.config.max_cached
+        return self.max_cached
 
     def crop(self, tokens_to_remove: int) -> None:
         if self.num_evicted > 0 and tokens_to_remove != 0:
@@ -235,6 +360,24 @@ class PrefixSlidingCache(DynamicCache):
             return 0
         return self.layers[layer_idx].num_evicted
 
+    def set_kv_start(self, kv_start, prefix_length=None) -> None:
+        """Left padding for the next sequence on every layer (incl. layers
+        created later); see ``PrefixSlidingLayer.set_kv_start``."""
+        for layer in self.layers:
+            layer.set_kv_start(kv_start, prefix_length)
+        if self.layer_class_to_replicate is not None:
+            self.layer_class_to_replicate = partial(_padded_layer, self.config, kv_start, prefix_length)
+
+    @property
+    def padding(self) -> LeftPadding | None:
+        return self.layers[0].padding if self.layers else None
+
+
+def _padded_layer(config: PrefixSlidingConfig, kv_start, prefix_length) -> PrefixSlidingLayer:
+    layer = PrefixSlidingLayer(config)
+    layer.set_kv_start(kv_start, prefix_length)
+    return layer
+
 
 def _gather_padding_mask(
     attention_mask: torch.Tensor, cache: PrefixSlidingCache, query_length: int
@@ -248,7 +391,7 @@ def _gather_padding_mask(
             "(cumulative tokens seen + current query length)"
         )
     idx = torch.arange(layer.stored_length + query_length, device=attention_mask.device)
-    return attention_mask[:, _stored_to_absolute(idx, cache.config.prefix_length, layer.num_evicted)]
+    return attention_mask[:, _stored_to_absolute(idx, layer.store_prefix, layer.num_evicted)]
 
 
 # --------------------------------------------------------------------------
@@ -269,8 +412,8 @@ def install(model, config: PrefixSlidingConfig, backend: str = "mask") -> None:
     The state is per model (unlike the first version, which patched the
     module for every Qwen2 model in the process).
 
-    Limitation: P counts absolute positions, so left padding eats into the
-    prefix. Batches should be unpadded (or right-padded for training).
+    Left padding (a 2-D ``attention_mask`` with leading zeros) shifts each
+    row's prefix past its pads: P counts real tokens in both backends.
     """
     from .integration import enable_prefix_sliding
 

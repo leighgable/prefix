@@ -44,6 +44,18 @@ anything else / no cache               prefill kernel on the full history
 
 The prefill path is the differentiable custom op (Triton backward); the
 decode path is inference-only.
+
+Left padding (``kv_start`` = S, pads at positions ``[0, S_b)`` of row b):
+
+* custom models: ``attend`` / ``attend_cached`` / ``block_attention(...,
+  kv_start=S)``. ``config.prefix_length`` stays an absolute position (pads
+  included), as in the kernels: a left-padded question ending at column
+  ``Lq`` in every row is ``prefix_length=Lq``. ``attend_cached`` hands the
+  padding to a prefix-sliding cache on its first (prefill) call.
+* transformers: a 2-D ``attention_mask`` of the form ``0...0 1...1`` per row
+  (left padding, as ``generate`` uses). P counts *real* tokens there, so the
+  prefix of row b is ``S_b + P`` (both backends). Other padding patterns
+  (right padding, gaps) raise ``NotImplementedError`` in the Triton backend.
 """
 
 from __future__ import annotations
@@ -64,6 +76,7 @@ from .monkeypatch import (
     PrefixSlidingConfig,
     _gather_padding_mask,
     evicted_cache_mask_function,
+    padded_layout,
     prefix_sliding_mask_function,
 )
 
@@ -90,8 +103,13 @@ __all__ = [
 # ==========================================================================
 
 
-def _dispatch(query, keys, values, *, config, cache, layer_idx, num_evicted, scale, rel_bias):
-    """``keys`` / ``values`` are what the cache returned for this forward."""
+def _dispatch(query, keys, values, *, config, cache, layer_idx, num_evicted, scale, rel_bias,
+              kv_start=None, prefix_length=None):  # fmt: skip
+    """``keys`` / ``values`` are what the cache returned for this forward.
+
+    ``kv_start`` / ``prefix_length``: per-row padding for caches that don't
+    keep their own (none / any transformers cache); absolute prefix (default
+    the config's P). Prefix-sliding caches use the padding they were given."""
     P, W = config.prefix_length, config.window_size
     if isinstance(cache, PrefixSlidingRingCache):
         layer = cache.layers[layer_idx]
@@ -110,33 +128,76 @@ def _dispatch(query, keys, values, *, config, cache, layer_idx, num_evicted, sca
             query, keys, values, prefix_length=P if layout.prefix_length is None else layout.prefix_length,
             window_size=W, num_evicted=layout.num_evicted, kv_start=layout.kv_start, scale=scale, rel_bias=rel_bias,
         )  # fmt: skip
+    if isinstance(cache, PrefixSlidingCache):
+        layer = cache.layers[layer_idx]
+        if layer.padding is not None:
+            S_t, P_t = layer.row_tensors(query.shape[0], query.device)
+            keys, values, kw = padded_layout(keys, values, store_prefix=layer.store_prefix, prefix=P_t, kv_start=S_t,
+                                             gap=num_evicted)  # fmt: skip
+            return prefix_sliding_attention(query, keys, values, window_size=W, scale=scale, rel_bias=rel_bias, **kw)
+        kv_start = prefix_length = None  # unpadded cache
+    if kv_start is None and prefix_length is None:
+        return prefix_sliding_attention(
+            query, keys, values, prefix_length=P, window_size=W, num_evicted=num_evicted, scale=scale, rel_bias=rel_bias
+        )
     return prefix_sliding_attention(
-        query, keys, values, prefix_length=P, window_size=W, num_evicted=num_evicted, scale=scale, rel_bias=rel_bias
-    )
+        query, keys, values, prefix_length=P if prefix_length is None else prefix_length, window_size=W,
+        num_evicted=num_evicted, kv_start=0 if kv_start is None else kv_start, scale=scale, rel_bias=rel_bias,
+    )  # fmt: skip
 
 
-def attend(query, key, value, *, config: PrefixSlidingConfig, scale=None, rel_bias=None) -> torch.Tensor:
+def _set_cache_padding(cache, kv_start, prefix_length, check: bool = False) -> None:
+    """Hand the padding to a prefix-sliding cache at its first update. With
+    ``check`` (multi-token forwards; one host sync), later calls must carry
+    the same padding: it can't change once the cache holds the sequence, so
+    the first (prefill) forward must contain all of each row's pads."""
+    if not isinstance(cache, (PrefixSlidingCache, PrefixSlidingRingCache)):
+        return
+    if cache.get_seq_length() == 0:
+        cache.set_kv_start(0 if kv_start is None else kv_start, prefix_length)
+    elif check:
+        have = cache.padding
+        S_have = have.kv_start if have is not None else torch.zeros(1, dtype=torch.long)
+        S_now = torch.zeros(1, dtype=torch.long) if kv_start is None else torch.as_tensor(kv_start).cpu().long()
+        if not torch.equal(*torch.broadcast_tensors(S_have, S_now.reshape(-1))):
+            raise ValueError(
+                f"left padding changed after the first forward ({S_have.tolist()} -> {S_now.tolist()}): "
+                "the first (prefill) forward must contain all of each row's padding"
+            )
+
+
+def attend(query, key, value, *, config: PrefixSlidingConfig, scale=None, rel_bias=None, kv_start=None) -> torch.Tensor:
     """Prefix sliding attention over a full sequence (training / no cache).
 
     q ``[B, Hq, T, D]``, k / v ``[B, Hkv, T, D]``; ``rel_bias`` optional
-    profile ``[B, Hq, T, E]``. Returns ``[B, Hq, T, D]``. Differentiable.
+    profile ``[B, Hq, T, E]``; ``kv_start`` optional left padding (int or
+    ``[B]``: row b's positions ``< kv_start[b]`` are never attended; its pad
+    queries give 0). ``config.prefix_length`` is absolute (pads included).
+    Returns ``[B, Hq, T, D]``. Differentiable.
     """
     return _dispatch(query, key, value, config=config, cache=None, layer_idx=None, num_evicted=0, scale=scale,
-                     rel_bias=rel_bias)  # fmt: skip
+                     rel_bias=rel_bias, kv_start=kv_start)  # fmt: skip
 
 
 def attend_cached(
-    query, key, value, *, config: PrefixSlidingConfig, cache, layer_idx: int, scale=None, rel_bias=None
-) -> torch.Tensor:
+    query, key, value, *, config: PrefixSlidingConfig, cache, layer_idx: int, scale=None, rel_bias=None,
+    kv_start=None,
+) -> torch.Tensor:  # fmt: skip
     """Append the new ``key`` / ``value`` (``[B, Hkv, Q, D]``) to ``cache`` and
     attend with the new queries (``[B, Hq, Q, D]``, positions continuing from
     the cache). Works with ``PrefixSlidingRingCache`` (fast decoding),
     ``PrefixSlidingCache`` and any transformers ``Cache``.
+
+    ``kv_start``: left padding (as in ``attend``). A prefix-sliding cache
+    takes it on its first (prefill) call and keeps it (later values are
+    ignored; one host read); other caches need it on every call.
     """
+    if kv_start is not None:
+        _set_cache_padding(cache, kv_start, None)
     num_evicted = cache.num_evicted(layer_idx) if isinstance(cache, PrefixSlidingCache) else 0  # before update
     keys, values = cache.update(key, value, layer_idx)
     return _dispatch(query, keys, values, config=config, cache=cache, layer_idx=layer_idx, num_evicted=num_evicted,
-                     scale=scale, rel_bias=rel_bias)  # fmt: skip
+                     scale=scale, rel_bias=rel_bias, kv_start=kv_start)  # fmt: skip
 
 
 # ==========================================================================
@@ -151,6 +212,9 @@ class PrefixSlidingMeta:
     config: PrefixSlidingConfig
     cache: object | None
     num_evicted: int = 0  # PrefixSlidingCache: gap *before* this forward's update
+    # left padding for caches that don't keep their own: [B] device tensors (or None)
+    kv_start: torch.Tensor | None = None
+    prefix_length: torch.Tensor | None = None  # absolute: kv_start + P
 
 
 def hf_attention_forward(module, query, key, value, attention_mask, scaling=None, dropout=0.0, **kwargs):
@@ -161,7 +225,8 @@ def hf_attention_forward(module, query, key, value, attention_mask, scaling=None
     if dropout:
         raise NotImplementedError("attention dropout is not supported")
     out = _dispatch(query, key, value, config=meta.config, cache=meta.cache, layer_idx=module.layer_idx,
-                    num_evicted=meta.num_evicted, scale=scaling, rel_bias=None)  # fmt: skip
+                    num_evicted=meta.num_evicted, scale=scaling, rel_bias=None, kv_start=meta.kv_start,
+                    prefix_length=meta.prefix_length)  # fmt: skip
     return out.transpose(1, 2), None
 
 
@@ -182,14 +247,42 @@ def _check_cache(config: PrefixSlidingConfig, cache) -> None:
         raise ValueError(f"cache config {cache.config} != enabled config {config}")
 
 
+def left_padding(attention_mask, validate: bool) -> torch.Tensor | None:
+    """Leading zeros per row of a 2-D ``attention_mask`` (``[B]`` device
+    tensor, no sync), or None without a 2-D mask.
+
+    ``validate`` (one host sync): raise unless every row is ``0...0 1...1``,
+    and return None when nothing is padded."""
+    if not (isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 2):
+        return None
+    real = attention_mask != 0
+    S = (real.long().cumsum(-1) == 0).sum(-1)
+    if validate:
+        cols = torch.arange(real.shape[-1], device=real.device)
+        if not bool((real == (cols[None] >= S[:, None])).all()):
+            raise NotImplementedError(
+                "the prefix sliding Triton backend supports only left padding (each attention_mask row 0...0 1...1)"
+            )
+        if not bool(S.any()):
+            return None
+    return S
+
+
 def _build_meta(config, cache, attention_mask, q_len: int) -> PrefixSlidingMeta:
+    """Per-forward metadata. Left padding comes from the 2-D mask: validated on
+    multi-token forwards (one host sync, as before); decode steps take it
+    without a sync. Prefix-sliding caches get it at prefill and keep it."""
     _check_cache(config, cache)
-    if isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 2 and q_len > 1:
-        # Checked on multi-token forwards only (decode steps would pay a host sync).
-        if not bool(attention_mask.all()):
-            raise NotImplementedError("padding is not supported by the prefix sliding Triton backend")
+    S = left_padding(attention_mask, validate=q_len > 1)
+    P = config.prefix_length
     num_evicted = cache.num_evicted() if isinstance(cache, PrefixSlidingCache) else 0
-    return PrefixSlidingMeta(config, cache, num_evicted)
+    if isinstance(cache, (PrefixSlidingCache, PrefixSlidingRingCache)):
+        if q_len > 1 or cache.get_seq_length() == 0:  # decode steps: the cache's padding, no sync
+            _set_cache_padding(cache, S, None if S is None else S + P, check=q_len > 1)
+        return PrefixSlidingMeta(config, cache, num_evicted)
+    if S is None:
+        return PrefixSlidingMeta(config, cache, num_evicted)
+    return PrefixSlidingMeta(config, cache, num_evicted, kv_start=S, prefix_length=S + P)
 
 
 def _patch_module(module) -> None:
@@ -223,13 +316,23 @@ def _patch_module(module) -> None:
             raise RuntimeError(
                 "PrefixSlidingRingCache needs the Triton backend: enable_prefix_sliding(model, cfg, backend='triton')"
             )
+        pad = arguments.get("attention_mask")
+        S = left_padding(pad, validate=False)  # any padding pattern; the prefix shifts past the leading pads
         if isinstance(cache, PrefixSlidingCache):
-            mask_fn = evicted_cache_mask_function(config, cache.num_evicted())
-            pad = arguments.get("attention_mask")
+            if S is not None and not bool(S.any()):  # host sync: fine for the reference backend
+                S = None
+            _set_cache_padding(cache, S, None if S is None else S + config.prefix_length,
+                               check=arguments["inputs_embeds"].shape[1] > 1)  # fmt: skip
+            padding = cache.padding
+            if padding is None:
+                mask_fn = evicted_cache_mask_function(config, cache.num_evicted())
+            else:
+                prefix = padding.prefix.to(arguments["inputs_embeds"].device)
+                mask_fn = evicted_cache_mask_function(config, cache.num_evicted(), prefix, cache.layers[0].store_prefix)
             if isinstance(pad, torch.Tensor) and pad.ndim == 2 and len(cache.layers) > 0:
                 arguments["attention_mask"] = _gather_padding_mask(pad, cache, arguments["inputs_embeds"].shape[1])
         else:
-            mask_fn = prefix_sliding_mask_function(config)
+            mask_fn = prefix_sliding_mask_function(config, None if S is None else S + config.prefix_length)
         existing = arguments.get("and_mask_function")
         arguments["and_mask_function"] = mask_fn if existing is None else and_masks(existing, mask_fn)
         return original(*bound.args, **bound.kwargs)
@@ -370,7 +473,9 @@ def relative_bias_profile(hidden: torch.Tensor, r_proj: torch.nn.Module, bias_ba
     return torch.einsum("bthd,de->bhte", rel, bias_bank)
 
 
-def block_attention(block, h: torch.Tensor, config: PrefixSlidingConfig, cache=None, layer_idx: int | None = None):
+def block_attention(
+    block, h: torch.Tensor, config: PrefixSlidingConfig, cache=None, layer_idx: int | None = None, kv_start=None
+):
     """Attention part of the sketch's ``Block.forward`` with prefix sliding.
 
     Replaces::
@@ -383,6 +488,8 @@ def block_attention(block, h: torch.Tensor, config: PrefixSlidingConfig, cache=N
     ``block.n_heads``, ``block.head_dim``, ``block.rel_bias.{r_proj, bias_bank}``.
     Without a cache: the whole sequence (training, differentiable). With a
     cache: ``h`` holds only the new tokens, positions continue from the cache.
+    ``kv_start``: left padding per row (see ``attend``; the prefix stays
+    absolute, e.g. the column where every left-padded question ends).
     """
     B, T, D = h.shape
     H, hd = block.n_heads, block.head_dim
@@ -390,7 +497,7 @@ def block_attention(block, h: torch.Tensor, config: PrefixSlidingConfig, cache=N
     q, k, v = (t.view(B, T, H, hd).transpose(1, 2) for t in (q, k, v))
     profile = relative_bias_profile(h, block.rel_bias.r_proj, block.rel_bias.bias_bank, H)
     if cache is None:
-        a = attend(q, k, v, config=config, rel_bias=profile)
+        a = attend(q, k, v, config=config, rel_bias=profile, kv_start=kv_start)
     else:
-        a = attend_cached(q, k, v, config=config, cache=cache, layer_idx=layer_idx, rel_bias=profile)
+        a = attend_cached(q, k, v, config=config, cache=cache, layer_idx=layer_idx, rel_bias=profile, kv_start=kv_start)
     return a.transpose(1, 2).reshape(B, T, D)

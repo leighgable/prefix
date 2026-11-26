@@ -246,9 +246,12 @@ def sketch_attention_ref(block, h, ps_cfg):
     return (scores.softmax(-1) @ v).transpose(1, 2).reshape(B, T, D)
 
 
-def block_forward(block, x, ps_cfg, *, ref=False, cache=None, layer_idx=None):
+def block_forward(block, x, ps_cfg, *, ref=False, cache=None, layer_idx=None, kv_start=None):
     h = block.ln1(x)
-    a = sketch_attention_ref(block, h, ps_cfg) if ref else block_attention(block, h, ps_cfg, cache, layer_idx)
+    if ref:
+        a = sketch_attention_ref(block, h, ps_cfg)
+    else:
+        a = block_attention(block, h, ps_cfg, cache, layer_idx, kv_start=kv_start)
     x = x + block.o_proj(a)
     return x + block.ff(block.ln2(x))
 
@@ -304,3 +307,220 @@ def test_sketch_incremental_decoding(blocks, sketch_cfg, cache_kind) -> None:
             s += c
         got = torch.cat(outs, 1)
     torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-4)
+
+
+# --------------------------------------------------------------------------
+# left padding (Qwen family): P counts real tokens, prefix of row b = S_b + P
+# --------------------------------------------------------------------------
+
+PAD_LENS = (70, 52, 61)  # real tokens per row; S_b = 70 - len
+
+
+def left_padded(ids, lens=PAD_LENS, pad_id=0):
+    """``(ids [B, L], mask, position_ids)``, rows right-aligned, positions from
+    each row's first real token (as ``generate`` makes them)."""
+    L = max(lens)
+    out = torch.full((len(lens), L), pad_id, dtype=ids.dtype, device=ids.device)
+    for b, n in enumerate(lens):
+        out[b, L - n :] = ids[b % ids.shape[0], :n]
+    mask = (torch.arange(L, device=ids.device)[None] >= torch.tensor([L - n for n in lens], device=ids.device)[:, None])
+    mask = mask.long()
+    pos = (mask.cumsum(-1) - 1).masked_fill(mask == 0, 1)
+    return out, mask, pos
+
+
+def run_padded(model, ids, mask, pos, cache, chunks):
+    """Chunked forward with the growing 2-D mask; chunks, then single tokens."""
+    outs, s, n = [], 0, ids.shape[1]
+    sizes = list(chunks) + [1] * n
+    with torch.no_grad():
+        for c in sizes:
+            if s >= n:
+                break
+            c = min(c, n - s)
+            outs.append(model(ids[:, s : s + c], attention_mask=mask[:, : s + c], position_ids=pos[:, s : s + c],
+                              past_key_values=cache).logits)  # fmt: skip
+            s += c
+    return torch.cat(outs, 1)
+
+
+def mask_backend_padded(model, ids, mask, pos):
+    enable_prefix_sliding(model, CFG, backend="mask")
+    try:
+        with torch.no_grad():
+            return model(ids, attention_mask=mask, position_ids=pos, use_cache=False).logits
+    finally:
+        disable_prefix_sliding(model)
+
+
+# prefill 20 (ring: slow path; it must hold every row's pads), decode, then a
+# 9-token chunk once the prefix region (7 + max S = 25 slots) is followed by an
+# evicted gap: the slow path's shifted layout
+PAD_SCHEDULE = [20, 1, 3] + [1] * 20 + [9]
+
+
+@pytest.mark.parametrize("cache_kind", ["none", *CACHES])
+def test_left_padded_triton_matches_mask_backend(family, ids, cache_kind) -> None:
+    name, model = family
+    pids, mask, pos = left_padded(ids)
+    ref = mask_backend_padded(model, pids, mask, pos)
+    enable_prefix_sliding(model, CFG)
+    if cache_kind == "none":
+        with torch.no_grad():
+            got = model(pids, attention_mask=mask, position_ids=pos, use_cache=False).logits
+    else:
+        got = run_padded(model, pids, mask, pos, CACHES[cache_kind](model), PAD_SCHEDULE)
+    real = mask.bool()
+    torch.testing.assert_close(got[real], ref[real], rtol=1e-4, atol=1e-4, msg=f"{name} {cache_kind}")
+
+
+def test_left_padded_rows_equal_unpadded_rows(family, ids) -> None:
+    """Each padded row == that row run alone (Triton, no padding)."""
+    name, model = family
+    pids, mask, pos = left_padded(ids)
+    enable_prefix_sliding(model, CFG)
+    with torch.no_grad():
+        got = model(pids, attention_mask=mask, position_ids=pos, use_cache=False).logits
+        for b, n in enumerate(PAD_LENS):
+            alone = model(ids[b % 2 : b % 2 + 1, :n], use_cache=False).logits
+            torch.testing.assert_close(got[b : b + 1, -n:], alone, rtol=1e-4, atol=1e-4, msg=f"{name} row {b}")
+
+
+def test_mask_backend_left_padded_eviction(family, ids) -> None:
+    """The mask backend's eviction cache keeps max(S) + P prefix slots too."""
+    name, model = family
+    pids, mask, pos = left_padded(ids)
+    ref = mask_backend_padded(model, pids, mask, pos)
+    enable_prefix_sliding(model, CFG, backend="mask")
+    cache = PrefixSlidingCache(CFG, model.config)
+    got = run_padded(model, pids, mask, pos, cache, [20])
+    assert cache.layers[0].store_prefix == CFG.prefix_length + max(PAD_LENS) - min(PAD_LENS)
+    real = mask.bool()
+    torch.testing.assert_close(got[real], ref[real], rtol=1e-4, atol=1e-4, msg=name)
+
+
+GEN_LENS = (10, 6, 3)
+
+
+@pytest.mark.parametrize("setup", ["triton-ring", "triton-eviction", "mask-eviction"])
+def test_generate_left_padded_equals_rows(family, ids, setup) -> None:
+    """``model.generate`` on a left-padded batch == each row generated alone
+    (greedy tokens exact). The window slides and the prefix (7 real tokens)
+    reaches into the generated text for the short prompts."""
+    name, model = family
+    backend, kind = setup.split("-")
+    make = (lambda: PrefixSlidingRingCache(CFG, model.config)) if kind == "ring" else (
+        lambda: PrefixSlidingCache(CFG, model.config))  # fmt: skip
+    pids, mask, _ = left_padded(ids, GEN_LENS)
+    gen = dict(max_new_tokens=40, do_sample=False, pad_token_id=0)
+    enable_prefix_sliding(model, CFG, backend=backend)
+    with torch.no_grad():
+        batch = model.generate(pids, attention_mask=mask, past_key_values=make(), **gen)
+        L = pids.shape[1]
+        for b, n in enumerate(GEN_LENS):
+            alone = model.generate(ids[b % 2 : b % 2 + 1, :n], past_key_values=make(), **gen)
+            assert torch.equal(batch[b, L:], alone[0, n:]), f"{name} {setup} row {b}"
+
+
+def test_graphed_greedy_left_padded(family, ids) -> None:
+    """``greedy_generate`` (graph-replayed decode, per-row position ids) on a
+    padded batch == eager == each row alone."""
+    from prefix.modeling.decoding import greedy_generate
+
+    name, model = family
+    if "moe" in name:
+        pytest.skip("transformers' MoE routing copies to the host: not graph-capturable (padding or not)")
+    pids, mask, _ = left_padded(ids, GEN_LENS)
+    enable_prefix_sliding(model, CFG)
+    out = {
+        g: greedy_generate(model, pids, PrefixSlidingRingCache(CFG, model.config), 30, use_graph=g, attention_mask=mask)
+        for g in (False, True)
+    }
+    assert torch.equal(out[True], out[False]), name
+    L = pids.shape[1]
+    for b, n in enumerate(GEN_LENS):
+        alone = greedy_generate(model, ids[b % 2 : b % 2 + 1, :n], PrefixSlidingRingCache(CFG, model.config), 30,
+                                use_graph=False)  # fmt: skip
+        assert torch.equal(out[True][b, L:], alone[0, n:]), f"{name} row {b}"
+
+
+def test_training_gradients_left_padded(family, ids) -> None:
+    """Padded batch, loss on real tokens: Triton grads == mask backend (eager) grads."""
+    name, model = family
+    pids, mask, pos = left_padded(ids)
+    # no loss on pads, nor on the first real token (predicted from the last pad)
+    labels = pids.masked_fill(mask.cumsum(-1) <= 1, -100)
+    model.zero_grad(set_to_none=True)
+    enable_prefix_sliding(model, CFG, backend="mask")
+    model(pids, attention_mask=mask, position_ids=pos, labels=labels, use_cache=False).loss.backward()
+    disable_prefix_sliding(model)
+    ref = {k: p.grad.clone() for k, p in model.named_parameters() if p.grad is not None}
+    model.zero_grad(set_to_none=True)
+    enable_prefix_sliding(model, CFG)
+    model(pids, attention_mask=mask, position_ids=pos, labels=labels, use_cache=False).loss.backward()
+    for k, p in model.named_parameters():
+        if k in ref:
+            torch.testing.assert_close(p.grad, ref[k], rtol=1e-3, atol=1e-5, msg=f"{name} {k}")
+    model.zero_grad(set_to_none=True)
+
+
+# --------------------------------------------------------------------------
+# left padding (sketch): absolute prefix, kv_start through block_attention
+# --------------------------------------------------------------------------
+
+
+def test_sketch_left_padded_equals_rows(blocks, sketch_cfg) -> None:
+    """Left-padded questions ending at the same column: ``block_attention(...,
+    kv_start=S)`` with the absolute prefix (that column, P = 5) == each row run
+    alone with its own real prefix length ``P - S_b``; also the gradients."""
+    ps = config_from_latent_cfg(sketch_cfg)
+    lens = (40, 37, 39)  # real tokens per row
+    L = max(lens)
+    S = torch.tensor([L - n for n in lens], device="cuda")
+    g = torch.Generator().manual_seed(4)
+    x = torch.randn(len(lens), L, 64, generator=g).cuda()  # the pads hold junk
+    real = S[:, None] <= torch.arange(L, device="cuda")[None]
+    out = trunk(blocks, x, ps, kv_start=S)
+    out[real].square().sum().backward()
+    padded_grads = {k: p.grad.clone() for k, p in blocks.named_parameters()}
+    blocks.zero_grad(set_to_none=True)
+    total = 0
+    for b, n in enumerate(lens):
+        s = L - n
+        alone = trunk(blocks, x[b : b + 1, s:], PrefixSlidingConfig(max(ps.prefix_length - s, 0), ps.window_size))
+        torch.testing.assert_close(out[b, s:], alone[0], rtol=1e-4, atol=1e-4, msg=f"row {b}")
+        total = total + alone.square().sum()
+    total.backward()
+    for k, p in blocks.named_parameters():
+        rel = (padded_grads[k] - p.grad).norm() / p.grad.norm().clamp_min(1e-12)
+        assert rel < 1e-4, f"{k}: rel grad err {rel:.2e}"
+    blocks.zero_grad(set_to_none=True)
+
+
+@pytest.mark.parametrize("cache_kind", ["ring", "eviction"])
+def test_sketch_left_padded_incremental(blocks, sketch_cfg, cache_kind) -> None:
+    """Padded latent loop: prefill + single steps (and a big chunk after
+    eviction) through a cache == the padded full-sequence trunk."""
+    ps = config_from_latent_cfg(sketch_cfg)
+    S = torch.tensor([0, 4, 2], device="cuda")
+    x = torch.randn(3, 60, 64, generator=torch.Generator().manual_seed(5)).cuda()
+    with torch.no_grad():
+        ref = trunk(blocks, x, ps, kv_start=S)
+        cache = PrefixSlidingRingCache(ps, max_chunk=4) if cache_kind == "ring" else PrefixSlidingCache(ps)
+        outs, s = [], 0
+        for c in [9, 1, 3] + [1] * 25 + [7] + [1] * 15:  # the 7-chunk: ring slow path with a gap
+            outs.append(trunk(blocks, x[:, s : s + c], ps, cache=cache, kv_start=S))
+            s += c
+        got = torch.cat(outs, 1)
+    real = torch.arange(60, device="cuda")[None] >= S[:, None]
+    torch.testing.assert_close(got[real], ref[real], rtol=1e-4, atol=1e-4)
+
+
+def test_left_padding_must_be_complete_at_prefill(ids) -> None:
+    """A row still padded after the first forward can't be cached correctly: error."""
+    torch.manual_seed(0)
+    model = FAMILIES["qwen2"]().cuda().eval()
+    pids, mask, pos = left_padded(ids)  # row 1 has 18 pads
+    enable_prefix_sliding(model, CFG)
+    with pytest.raises(ValueError, match="prefill"):
+        run_padded(model, pids, mask, pos, PrefixSlidingRingCache(CFG, model.config), [12, 8])

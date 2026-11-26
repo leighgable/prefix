@@ -114,10 +114,19 @@ def _attend_ring(ring, q, k_st, v_st, seen, P, W, bias):
 
 @st.composite
 def padded_schedules(draw):
+    """Per-row pads S_b and absolute prefixes P_b: shifted (S_b + P, the HF
+    convention), one shared column (a left-padded question), or anything."""
     P, W, chunk, chunks = draw(schedules())
     B = draw(st.integers(1, 3))
     S = draw(st.lists(st.integers(0, 9), min_size=B, max_size=B))
-    return P, W, chunk, chunks, S
+    mode = draw(st.sampled_from(["shifted", "column", "any"]))
+    if mode == "shifted":
+        prefix = [s + P for s in S]
+    elif mode == "column":
+        prefix = [P] * B
+    else:
+        prefix = draw(st.lists(st.integers(0, 16), min_size=B, max_size=B))
+    return P, W, chunk, chunks, S, prefix
 
 
 @settings(max_examples=300, deadline=None)
@@ -127,11 +136,11 @@ def test_padded_ring_matches_full_recompute(schedule, with_bias: bool, seed) -> 
     path with a gap, where rows are shifted by max(S) - S_b): every chunk's
     output == attention over the full history with per-row prefix S_b + P and
     kv_start S_b (pad queries: out 0). Pads hold junk."""
-    P, W, chunk, chunks, S_list = schedule
-    B, S = len(S_list), torch.tensor(S_list)
+    P, W, chunk, chunks, S_list, pre_list = schedule
+    B, S, Pb = len(S_list), torch.tensor(S_list), torch.tensor(pre_list)
     cfg = PrefixSlidingConfig(P, W)
     ring = PrefixSlidingRingLayer(cfg, max_chunk=chunk)
-    ring.set_kv_start(S)
+    ring.set_kv_start(S, Pb)
     g = torch.Generator().manual_seed(seed)
     n = sum(chunks)
     k_all = torch.randn(B, 2, n, 8, generator=g, dtype=torch.float64)
@@ -139,7 +148,8 @@ def test_padded_ring_matches_full_recompute(schedule, with_bias: bool, seed) -> 
     v_all = torch.randn(B, 2, n, 8, generator=g, dtype=torch.float64)
     q_all = torch.randn(B, 4, n, 8, generator=g, dtype=torch.float64)
     bias_all = torch.randn(B, 4, n, 5, generator=g, dtype=torch.float64) if with_bias else None
-    assert ring.capacity == P + int(S.max()) + W - 1 + chunk
+    padded = ring.padding is not None
+    assert ring.capacity == (int(Pb.max()) if padded else P) + W - 1 + chunk
 
     seen = 0
     for q_len in chunks:
@@ -150,20 +160,20 @@ def test_padded_ring_matches_full_recompute(schedule, with_bias: bool, seed) -> 
         lay = ring.last_layout
         if lay is RING:
             event("fast path")
-        elif isinstance(lay.prefix_length, int) and lay.kv_start:
+        elif isinstance(lay.prefix_length, int) and isinstance(lay.num_evicted, torch.Tensor):
             event("slow path, gap: rows shifted")
         else:
             event("slow path, no gap" if not isinstance(lay.num_evicted, torch.Tensor) else "slow path")
         expected, _ = attention_ref(
-            q_all[:, :, sl], k_all[:, :, :end], v_all[:, :, :end], prefix_length=S + P, window_size=W,
+            q_all[:, :, sl], k_all[:, :, :end], v_all[:, :, :end], prefix_length=Pb, window_size=W,
             q_start=seen, kv_start=S, compute_dtype=torch.float64, rel_bias=bias,
         )  # fmt: skip
         torch.testing.assert_close(got, expected, rtol=0, atol=1e-12, msg=f"chunk at {seen}: {ring.last_layout}")
         # each row keeps its whole prefix and its window
         valid = ring.positions >= 0
         stored = set(ring.positions[valid].tolist())
-        for s in S_list:
-            needed = set(range(s, min(s + P, end))) | set(range(max(s + P, end - W + 1), end))
+        for s, pb in zip(S_list, pre_list):
+            needed = set(range(s, min(pb, end))) | set(range(max(s, end - W + 1), end))
             assert needed <= stored, (s, sorted(needed - stored))
         assert torch.equal(ring.keys[0, 0, valid, 0].long(), ring.positions[valid].long())
         seen = end
@@ -174,13 +184,13 @@ def test_padded_slow_path_with_gap_shifts_rows() -> None:
     P, W, chunk = 3, 4, 2
     S = torch.tensor([0, 5, 2])
     ring = PrefixSlidingRingLayer(PrefixSlidingConfig(P, W), max_chunk=chunk)
-    ring.set_kv_start(S)
+    ring.set_kv_start(S, S + P)
     k = torch.arange(40, dtype=torch.float64).view(1, 1, 40, 1).expand(3, 1, 40, 1).contiguous()
     ring.update(k[:, :, :20], k[:, :, :20])  # prefill: contiguous, no gap
     assert ring.last_layout.num_evicted == 0 and ring.last_layout.prefix_length.tolist() == (S + P).tolist()
     k_st, _ = ring.update(k[:, :, 20:30], k[:, :, 20:30])  # tail_lo = 17 > P + max(S) = 8: gap
     lay = ring.last_layout
-    assert lay.prefix_length == 8 and lay.kv_start == 5
+    assert lay.prefix_length == 8 and lay.kv_start.tolist() == [5, 5, 5]  # S_b + d_b, d_b = 8 - P_b
     assert lay.num_evicted.tolist() == [17 - 3, 17 - 8, 17 - 5]  # tail_lo - P_b
     # row b's stored prefix region holds positions [-d_b, P_b): its real prefix ends at slot 8
     d = 5 - S
@@ -191,36 +201,40 @@ def test_padded_slow_path_with_gap_shifts_rows() -> None:
 def test_set_kv_start_api() -> None:
     cfg = PrefixSlidingConfig(3, 4)
     cache = PrefixSlidingRingCache(cfg, max_chunk=2)
-    cache.set_kv_start(torch.tensor([0, 2]))
+    cache.set_kv_start(torch.tensor([0, 2]), torch.tensor([3, 5]))  # shifted: P_b = S_b + 3
     k = torch.randn(2, 1, 9, 4)
     cache.update(k, k.clone(), 0)
     layer = cache.layers[0]
-    assert layer.capacity == 3 + 2 + 3 + 2 and cache.kv_start.tolist() == [0, 2]
+    assert layer.capacity == 5 + 3 + 2 and cache.padding.kv_start.tolist() == [0, 2]
     assert layer.prefix.tolist() == [3, 5] and layer.kv_start.tolist() == [0, 2]
     with pytest.raises(RuntimeError, match="before the first update"):
         cache.set_kv_start(torch.tensor([1, 1]))
     with pytest.raises(ValueError):
         PrefixSlidingRingLayer(cfg).set_kv_start(torch.tensor([-1]))
-    # same max(S) and batch after reset: buffers (and any captured graph) stay valid
+    # same max(prefix) and batch after reset: buffers (and any captured graph) stay valid
     cache.reset()
     ptrs = (layer.keys.data_ptr(), layer.prefix.data_ptr(), layer.kv_start.data_ptr())
-    cache.set_kv_start(torch.tensor([2, 1]))
+    cache.set_kv_start(torch.tensor([2, 1]), torch.tensor([5, 4]))
     assert (layer.keys.data_ptr(), layer.prefix.data_ptr(), layer.kv_start.data_ptr()) == ptrs
     assert layer.prefix.tolist() == [5, 4]
-    # a bigger max(S) reallocates on the next update
+    # a bigger max(prefix) reallocates on the next update
     cache.reset()
-    cache.set_kv_start(torch.tensor([4, 0]))
+    cache.set_kv_start(torch.tensor([4, 0]), torch.tensor([7, 3]))
     cache.update(k, k.clone(), 0)
-    assert layer.keys.shape[2] == 3 + 4 + 3 + 2
+    assert layer.keys.shape[2] == 7 + 3 + 2
     # beam search reorders the per-row padding with the rows
     cache.reorder_cache(torch.tensor([1, 0]))
-    assert layer.kv_start.tolist() == [0, 4] and layer.prefix.tolist() == [3, 7] and cache.kv_start.tolist() == [0, 4]
-    # no padding (all zeros) is exactly the unpadded cache
+    assert layer.kv_start.tolist() == [0, 4] and layer.prefix.tolist() == [3, 7]
+    assert cache.padding.kv_start.tolist() == [0, 4] and cache.padding.prefix.tolist() == [3, 7]
+    # no padding (all zeros, default prefix) is exactly the unpadded cache
     cache.reset()
     cache.set_kv_start(torch.tensor([0, 0]))
-    assert cache.kv_start is None
+    assert cache.padding is None
+    # default prefix: the config's P, absolute (pads inside it, no extra slots)
+    cache.set_kv_start(torch.tensor([2, 0]))
+    assert cache.padding.prefix.tolist() == [3, 3] and layer.slot_prefix == 3
     # layers created lazily inherit the padding
     lazy = PrefixSlidingRingCache(cfg, max_chunk=2)
-    lazy.set_kv_start(torch.tensor([1, 3]))
+    lazy.set_kv_start(torch.tensor([1, 3]), torch.tensor([4, 6]))
     lazy.update(k, k.clone(), 0)
-    assert lazy.layers[0].kv_start.tolist() == [1, 3] and lazy.layers[0].pad_slots == 3
+    assert lazy.layers[0].kv_start.tolist() == [1, 3] and lazy.layers[0].slot_prefix == 6

@@ -383,3 +383,117 @@ def test_generate_ring_cache_triton(model, tokenizer, prompt_ids, cfg):
     assert_argmax_or_tie(ref, out[0, P:])
     print(f"\n--- ring cache + Triton decode (P={P}, W={WINDOW}) ---\n"
           f"{tokenizer.decode(out[0, P:], skip_special_tokens=True)}")  # fmt: skip
+
+
+# --------------------------------------------------------------------------
+# Milestone 5: left-padded batches (P counts real tokens; row b's prefix S_b + P)
+# --------------------------------------------------------------------------
+
+QUESTIONS = [
+    "What makes Mandarin a difficult language to learn?",
+    "Why is the sky blue?",
+    "Explain, step by step and with an example, how a hash table handles collisions.",
+]
+
+
+@pytest.fixture(scope="module")
+def padded_prompts(tokenizer):
+    """``(ids [B, L], mask)`` left-padded chat prompts, and the unpadded rows."""
+    rows = [
+        tokenizer.apply_chat_template(
+            [{"role": "system", "content": "You are Qwen."}, {"role": "user", "content": q}],
+            add_generation_prompt=True, return_tensors="pt", return_dict=True,
+        )["input_ids"][0]
+        for q in QUESTIONS
+    ]  # fmt: skip
+    L = max(len(r) for r in rows)
+    pad = tokenizer.pad_token_id
+    ids = torch.full((len(rows), L), pad, dtype=torch.long)
+    mask = torch.zeros(len(rows), L, dtype=torch.long)
+    for b, r in enumerate(rows):
+        ids[b, L - len(r) :], mask[b, L - len(r) :] = r, 1
+    return ids.to(DEVICE), mask.to(DEVICE), [r.to(DEVICE) for r in rows]
+
+
+@pytest.fixture(scope="module")
+def pad_cfg(padded_prompts):
+    # prefix = the shortest prompt (system turn + most of the user turn), in real tokens
+    return PrefixSlidingConfig(prefix_length=min(len(r) for r in padded_prompts[2]), window_size=WINDOW)
+
+
+@pytest.fixture(scope="module")
+def padded_generation(model, tokenizer, padded_prompts, pad_cfg):
+    """Batched greedy ``generate`` with left padding (Triton + ring cache), and
+    each row generated alone (unpadded). -> (batch [B, L + new], [row seqs])."""
+    from prefix.modeling.cache import PrefixSlidingRingCache
+
+    ids, mask, rows = padded_prompts
+    install(model, pad_cfg, backend="triton")
+    try:
+        with torch.no_grad():
+            batch = model.generate(ids, attention_mask=mask, past_key_values=PrefixSlidingRingCache(pad_cfg, model.config),
+                                   pad_token_id=tokenizer.pad_token_id, **GREEDY)  # fmt: skip
+            alone = [
+                model.generate(r[None], past_key_values=PrefixSlidingRingCache(pad_cfg, model.config), **GREEDY)[0]
+                for r in rows
+            ]
+    finally:
+        uninstall(model)
+    return batch, alone
+
+
+def _suppress_eos(model, logits):
+    """``min_new_tokens`` makes generate skip EOS: do the same to a reference."""
+    eos = model.generation_config.eos_token_id
+    eos = [eos] if isinstance(eos, int) else list(eos or [])
+    logits = logits.clone()
+    logits[..., eos] = float("-inf")
+    return logits
+
+
+def test_generate_left_padded_ring_equals_rows(model, tokenizer, padded_prompts, pad_cfg, padded_generation):
+    """Batched ``generate`` with left padding (Triton + ring cache) == each row
+    generated alone: tokens equal until the first bf16 near-tie (batch and
+    single-row GEMMs round differently), and every batched token is the
+    per-row reference argmax (or a near-tie)."""
+    ids, _, rows = padded_prompts
+    batch, alone = padded_generation
+    L = ids.shape[1]
+    for b, r in enumerate(rows):
+        n = len(r)
+        got, want = batch[b, L:], alone[b][n:]
+        ref = _suppress_eos(model, reference_logits(model, torch.cat([r, got])[None], pad_cfg)[0, n - 1 : -1])
+        assert_argmax_or_tie(ref, got)
+        diff = (got != want).nonzero()
+        if len(diff):  # allowed only where the reference itself nearly ties
+            i = int(diff[0])
+            top2 = ref[i].topk(2).values
+            assert top2[0] - top2[1] <= TIE_MARGIN, f"row {b}: diverged at {i} without a near-tie"
+        print(f"\n--- row {b} (S={L - n}, P={pad_cfg.prefix_length}): "
+              f"{'identical' if not len(diff) else f'identical up to a near-tie at token {int(diff[0])}'} ---\n"
+              f"{tokenizer.decode(got, skip_special_tokens=True)[:200]}")  # fmt: skip
+
+
+def test_left_padded_teacher_forced_matches_mask_backend(model, padded_prompts, pad_cfg, padded_generation):
+    """The batched generation (natural text) teacher-forced in one padded
+    forward: Triton vs mask backend (sdpa) disagree no more than they do on
+    each row unpadded (bf16 noise), and both stay close."""
+    ids, mask, rows = padded_prompts
+    batch, _ = padded_generation
+    mask = torch.cat([mask, torch.ones_like(batch[:, ids.shape[1] :])], 1)
+    pos = (mask.cumsum(-1) - 1).masked_fill(mask == 0, 1)
+    out = {}
+    for backend in ("mask", "triton"):
+        install(model, pad_cfg, backend=backend)
+        with torch.no_grad():
+            out[backend] = model(batch, attention_mask=mask, position_ids=pos, use_cache=False).logits.float()
+            for b in range(len(rows)):
+                n = int(mask[b].sum())
+                out[backend, b] = model(batch[b : b + 1, -n:], use_cache=False).logits.float()[0]
+        uninstall(model)
+    for b in range(len(rows)):
+        n = int(mask[b].sum())
+        padded = max_kl(out["mask"][b, -n:], out["triton"][b, -n:])
+        alone = max_kl(out["mask", b], out["triton", b])
+        print(f"row {b}: max KL(mask || triton) padded {padded:.2e}, unpadded {alone:.2e}")
+        assert padded <= max(MAX_KL, 2 * alone), f"row {b}: padded {padded:.3e} vs unpadded {alone:.3e}"

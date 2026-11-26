@@ -86,6 +86,7 @@ class GraphedDecoder:
         self.replays = 0  # replays of the current capture
         self.captures = 0
         self._ids = self._pos = self._logits = None
+        self._pads = None  # [B, 1] left padding per row (position ids start at the first real token)
 
     def _forward(self):
         return self.model(self._ids, position_ids=self._pos, past_key_values=self.cache, use_cache=True).logits
@@ -96,8 +97,13 @@ class GraphedDecoder:
         if self._ids is None:
             self._ids = torch.empty_like(input_ids)
             self._pos = torch.empty_like(input_ids)
+            padding = self.cache.padding
+            if padding is not None:
+                self._pads = padding.kv_start.expand(input_ids.shape[0]).to(input_ids.device).view(-1, 1)
         self._ids.copy_(input_ids)
         self._pos.fill_(self.cache.get_seq_length())  # host counter, no sync
+        if self._pads is not None:
+            self._pos.sub_(self._pads)  # as transformers: positions count real tokens
         self.steps += 1
 
         if not self.use_graph or self.steps <= self.warmup:
@@ -132,16 +138,24 @@ class GraphedDecoder:
 @torch.no_grad()
 def greedy_generate(
     model, input_ids: torch.Tensor, cache: PrefixSlidingRingCache, max_new_tokens: int,
-    use_graph: bool | None = None,
+    use_graph: bool | None = None, attention_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:  # fmt: skip
     """Greedy decoding: eager prefill, then (graph-replayed) single-token steps.
 
     ``use_graph`` defaults to True on CUDA and False on ROCm (see module doc).
+    ``attention_mask``: a left-padded batch's 2-D mask (``0...0 1...1`` per
+    row); position ids then start at each row's first real token, as in
+    ``model.generate``. The cache keeps the padding for the decode steps.
 
     Returns ``[B, prompt + max_new_tokens]``. No EOS handling (benchmarks /
     tests); use ``model.generate`` for full generation features.
     """
-    logits = model(input_ids, past_key_values=cache, use_cache=True).logits
+    if attention_mask is None:
+        logits = model(input_ids, past_key_values=cache, use_cache=True).logits
+    else:
+        pos = (attention_mask.long().cumsum(-1) - 1).clamp(min=0)
+        logits = model(input_ids, attention_mask=attention_mask, position_ids=pos, past_key_values=cache,
+                       use_cache=True).logits  # fmt: skip
     nxt = logits[:, -1:].argmax(-1)
     out = [input_ids, nxt]
     if use_graph is None:

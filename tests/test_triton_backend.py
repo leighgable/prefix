@@ -126,10 +126,11 @@ def test_install_uninstall_and_errors(model, ids) -> None:
     assert model.config._attn_implementation == "prefix_sliding_triton"
     with pytest.raises(ValueError):  # cache built for another config
         model(ids[:, :4], past_key_values=PrefixSlidingRingCache(PrefixSlidingConfig(3, 5), model.config))
-    with pytest.raises(NotImplementedError):  # left padding
+    for cols in ([7], [2, 3], [0, 3]):  # right padding / gaps (left padding is supported)
         pad = torch.ones_like(ids[:, :8])
-        pad[0, 0] = 0
-        model(ids[:, :8], attention_mask=pad, past_key_values=PrefixSlidingRingCache(CFG, model.config))
+        pad[0, cols] = 0
+        with pytest.raises(NotImplementedError, match="only left padding"):
+            model(ids[:, :8], attention_mask=pad, past_key_values=PrefixSlidingRingCache(CFG, model.config))
     uninstall(model)
     assert model.config._attn_implementation == "eager"
     install(model, CFG)  # mask backend can't read the ring layout: clear error
