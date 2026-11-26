@@ -120,7 +120,8 @@ def _dispatch(query, keys, values, *, config, cache, layer_idx, num_evicted, sca
                 raise RuntimeError("the ring-cache decode path is inference-only; use no cache to train")
             out, _ = prefix_sliding_decode(
                 query, keys, values, k_positions=layer.positions, prefix_length=layer.prefix, window_size=W,
-                q_start=layer.q_start, kv_len=layer.kv_len, kv_start=layer.kv_start, scale=scale, rel_bias=rel_bias,
+                q_start=layer.q_start, kv_len=layer.kv_len, scale=scale, rel_bias=rel_bias,
+                kv_start=layer.kv_start if layer.padding is not None else 0,  # 0: the unpadded kernel exactly
             )  # fmt: skip
             return out
         layout = layer.last_layout  # contiguous; carries the kernel arguments (padding-aware)

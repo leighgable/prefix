@@ -44,7 +44,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .fwd import LOG2E, _bias_arg, _n_bucket, _per_seq, first_at_or_after, kv_tile_ranges
+from .fwd import LOG2E, _bias_arg, _has_padding, _n_bucket, _per_seq, first_at_or_after, kv_tile_ranges
 from .reference import IntOrTensor, default_q_start, validate_layout
 
 # --------------------------------------------------------------------------
@@ -77,9 +77,12 @@ def _bwd_preprocess(
 
 
 @triton.jit
-def _allowed(k_abs, q_abs, P, W, S):
+def _allowed(k_abs, q_abs, P, W, S, HAS_PAD: tl.constexpr):
     """Mask for broadcastable absolute key / query positions (S = kv_start)."""
-    return (k_abs >= S) & (k_abs <= q_abs) & ((k_abs < P) | (k_abs > q_abs - W))
+    allowed = (k_abs <= q_abs) & ((k_abs < P) | (k_abs > q_abs - W))
+    if HAS_PAD:
+        allowed = allowed & (k_abs >= S)
+    return allowed
 
 
 @triton.jit
@@ -122,7 +125,7 @@ def _bwd_dkdv(
     N_BUCKET,  # autotune key only
     HEAD_DIM: tl.constexpr, HEAD_DIM_PAD: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, DOT_PRECISION: tl.constexpr,
-    HAS_BIAS: tl.constexpr = False,
+    HAS_BIAS: tl.constexpr = False, HAS_PAD: tl.constexpr = False,
 ):  # fmt: skip
     pid_bh = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -131,7 +134,10 @@ def _bwd_dkdv(
     P = tl.load(Prefix + b)
     E = tl.load(Evicted + b)
     qs = tl.load(QStart + b)
-    S = tl.load(KvStart + b)
+    if HAS_PAD:
+        S = tl.load(KvStart + b)
+    else:
+        S = 0
 
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, HEAD_DIM_PAD)
@@ -174,7 +180,7 @@ def _bwd_dkdv(
                 in_rng = (dist_t >= 0) & (dist_t < REL_E) & in_m[None, :] & in_n[:, None]
                 s_t += tl.load(bias_base + offs_m[None, :] * stride_bm + dist_t, mask=in_rng, other=0.0).to(tl.float32)
             p_t = _probs(s_t, row_max[None, :], row_l2[None, :], qk_scale)
-            allowed = _allowed(k_abs[:, None], (qs + offs_m)[None, :], P, W, S) & in_n[:, None] & in_m[None, :]
+            allowed = _allowed(k_abs[:, None], (qs + offs_m)[None, :], P, W, S, HAS_PAD) & in_n[:, None] & in_m[None, :]
             p_t = tl.where(allowed, p_t, 0.0)
             dv = tl.dot(p_t.to(do.dtype), do, dv, input_precision=DOT_PRECISION)
             dp_t = tl.dot(v, do_t, input_precision=DOT_PRECISION)  # [BN, BM]
@@ -194,7 +200,7 @@ def _dq_tiles(
     k_base, v_base, stride_kn, stride_vn, offs_d, in_d,
     lo, hi, P, E, S, W, Nk, qk_scale,
     bias_rows, dbias_rows, REL_E,
-    BLOCK_N: tl.constexpr, DOT_PRECISION: tl.constexpr, HAS_BIAS: tl.constexpr,
+    BLOCK_N: tl.constexpr, DOT_PRECISION: tl.constexpr, HAS_BIAS: tl.constexpr, HAS_PAD: tl.constexpr = False,
 ):  # fmt: skip
     for blk in range(lo, hi):
         offs_n = blk * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -213,7 +219,7 @@ def _dq_tiles(
             in_rng = (dist >= 0) & (dist < REL_E) & in_m[:, None] & in_n[None, :]
             s += tl.load(bias_rows[:, None] + dist, mask=in_rng, other=0.0).to(tl.float32)
         p = _probs(s, row_max[:, None], row_l2[:, None], qk_scale)
-        allowed = _allowed(k_abs[None, :], q_abs[:, None], P, W, S) & in_n[None, :] & in_m[:, None]
+        allowed = _allowed(k_abs[None, :], q_abs[:, None], P, W, S, HAS_PAD) & in_n[None, :] & in_m[:, None]
         p = tl.where(allowed, p, 0.0)
         dp = tl.dot(do, v_t, input_precision=DOT_PRECISION)  # [BM, BN]
         ds = p * (dp - delta[:, None])
@@ -239,7 +245,7 @@ def _bwd_dq(
     N_BUCKET,  # autotune key only
     HEAD_DIM: tl.constexpr, HEAD_DIM_PAD: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, DOT_PRECISION: tl.constexpr,
-    HAS_BIAS: tl.constexpr = False,
+    HAS_BIAS: tl.constexpr = False, HAS_PAD: tl.constexpr = False,
 ):  # fmt: skip
     pid_m = tl.program_id(0)
     pid_bh = tl.program_id(1)
@@ -249,7 +255,10 @@ def _bwd_dq(
     P = tl.load(Prefix + b)
     E = tl.load(Evicted + b)
     qs = tl.load(QStart + b)
-    S = tl.load(KvStart + b)
+    if HAS_PAD:
+        S = tl.load(KvStart + b)
+    else:
+        S = 0
 
     row_lo = pid_m * BLOCK_M
     offs_m = row_lo + tl.arange(0, BLOCK_M)
@@ -272,10 +281,10 @@ def _bwd_dq(
     dq = tl.zeros([BLOCK_M, HEAD_DIM_PAD], dtype=tl.float32)
     dq = _dq_tiles(dq, q, do, row_max, row_l2, delta, q_abs, in_m, k_base, v_base, stride_kn, stride_vn, offs_d, in_d,
                    a_start, a_end, P, E, S, W, Nk, qk_scale, Bias + bias_off, DBias + bias_off, REL_E,
-                   BLOCK_N, DOT_PRECISION, HAS_BIAS)  # fmt: skip
+                   BLOCK_N, DOT_PRECISION, HAS_BIAS, HAS_PAD)  # fmt: skip
     dq = _dq_tiles(dq, q, do, row_max, row_l2, delta, q_abs, in_m, k_base, v_base, stride_kn, stride_vn, offs_d, in_d,
                    b_start, b_end, P, E, S, W, Nk, qk_scale, Bias + bias_off, DBias + bias_off, REL_E,
-                   BLOCK_N, DOT_PRECISION, HAS_BIAS)  # fmt: skip
+                   BLOCK_N, DOT_PRECISION, HAS_BIAS, HAS_PAD)  # fmt: skip
     dq = dq * sm_scale
     tl.store(DQ + b * stride_dqb + h * stride_dqh + offs_m[:, None] * stride_dqm + offs_d[None, :],
              dq.to(DQ.dtype.element_ty), mask=q_mask)  # fmt: skip
@@ -334,7 +343,7 @@ def prefix_sliding_attention_bwd(
     window_size: int,
     q_start: IntOrTensor | None = None,
     num_evicted: IntOrTensor = 0,
-    kv_start: IntOrTensor = 0,
+    kv_start: IntOrTensor | None = 0,
     scale: float | None = None,
     dlse: torch.Tensor | None = None,
     stats: torch.Tensor | None = None,
@@ -361,10 +370,12 @@ def prefix_sliding_attention_bwd(
     B, Hq, Nq, D = q.shape
     Hkv, Nk = k.shape[1], k.shape[2]
     if q_start is None:
-        validate_layout(Nq, Nk, prefix_length, window_size, num_evicted, kv_start)
+        validate_layout(Nq, Nk, prefix_length, window_size, num_evicted, 0 if kv_start is None else kv_start)
         q_start = default_q_start(Nq, Nk, prefix_length, num_evicted)
     dev = q.device
-    P_t, E_t, qs_t, S_t = (_per_seq(x, B, dev) for x in (prefix_length, num_evicted, q_start, kv_start))
+    P_t, E_t, qs_t = (_per_seq(x, B, dev) for x in (prefix_length, num_evicted, q_start))
+    has_pad = _has_padding(kv_start)
+    S_t = _per_seq(kv_start, B, dev) if has_pad else P_t  # dummy pointer when unpadded (never read)
     scale = 1.0 / math.sqrt(D) if scale is None else scale
     q, k, v, out, do = (_unit_last(t) for t in (q, k, v, out, do))
     lse = lse.contiguous()
@@ -393,7 +404,8 @@ def prefix_sliding_attention_bwd(
 
     group = Hq // Hkv
     common = (Nq, Nk, int(window_size), scale, scale * LOG2E, _n_bucket(Nq))
-    meta = dict(HEAD_DIM=D, HEAD_DIM_PAD=head_pad, DOT_PRECISION="ieee", HAS_BIAS=rel_bias is not None)
+    meta = dict(HEAD_DIM=D, HEAD_DIM_PAD=head_pad, DOT_PRECISION="ieee", HAS_BIAS=rel_bias is not None,
+                HAS_PAD=has_pad)
     dkdv_args = (
         q, k, v, do, stats[0], stats[1], delta, dk, dv, P_t, E_t, qs_t, S_t, bias_raw,
         q.stride(0), q.stride(1), q.stride(2),

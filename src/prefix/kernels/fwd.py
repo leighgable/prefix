@@ -104,7 +104,7 @@ def _tiles(
     P, E, S, W, Nk, qk_scale,
     bias_rows, in_m, REL_E,
     BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr, HEAD_DIM_PAD: tl.constexpr,
-    MASKED: tl.constexpr, DOT_PRECISION: tl.constexpr, HAS_BIAS: tl.constexpr,
+    MASKED: tl.constexpr, DOT_PRECISION: tl.constexpr, HAS_BIAS: tl.constexpr, HAS_PAD: tl.constexpr = False,
 ):  # fmt: skip
     """Online-softmax over key tiles [lo, hi). MASKED=False only for full tiles.
 
@@ -157,7 +157,10 @@ def _tiles(
             allowed = (k_abs[None, :] <= q_abs[:, None]) & (
                 (k_abs[None, :] < P) | (k_abs[None, :] > q_abs[:, None] - W)
             )
-            allowed = allowed & ((offs_n < Nk) & (k_abs >= S))[None, :]  # in bounds, not padding
+            if HAS_PAD:
+                allowed = allowed & ((offs_n < Nk) & (k_abs >= S))[None, :]  # in bounds, not padding
+            else:
+                allowed = allowed & (offs_n < Nk)[None, :]
             qk = tl.where(allowed, qk, float("-inf"))
 
         m_new = tl.maximum(m_i, tl.max(qk, 1))
@@ -189,6 +192,7 @@ def _prefix_sliding_fwd(
     HEAD_DIM: tl.constexpr, HEAD_DIM_PAD: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
     SPLIT_FULL: tl.constexpr, DOT_PRECISION: tl.constexpr, HAS_BIAS: tl.constexpr = False,
+    HAS_PAD: tl.constexpr = False,
 ):  # fmt: skip
     pid_m = tl.program_id(0)
     pid_bh = tl.program_id(1)
@@ -198,7 +202,10 @@ def _prefix_sliding_fwd(
     P = tl.load(Prefix + b)
     E = tl.load(Evicted + b)
     qs = tl.load(QStart + b)
-    S = tl.load(KvStart + b)
+    if HAS_PAD:
+        S = tl.load(KvStart + b)
+    else:
+        S = 0  # no padding: everything derived from S folds away (the unpadded kernel)
 
     row_lo = pid_m * BLOCK_M
     offs_m = row_lo + tl.arange(0, BLOCK_M)
@@ -226,23 +233,23 @@ def _prefix_sliding_fwd(
     # unmasked interior, masked causal edge
     acc, l_i, m_i = _tiles(acc, l_i, m_i, q, q_abs, k_base, v_base, stride_kn, stride_vn, offs_d,
                            a_start, a_lo, P, E, S, W, Nk, qk_scale, bias_rows, in_m, REL_E,
-                           BLOCK_N, HEAD_DIM, HEAD_DIM_PAD, True, DOT_PRECISION, HAS_BIAS)  # fmt: skip
+                           BLOCK_N, HEAD_DIM, HEAD_DIM_PAD, True, DOT_PRECISION, HAS_BIAS, HAS_PAD)  # fmt: skip
     acc, l_i, m_i = _tiles(acc, l_i, m_i, q, q_abs, k_base, v_base, stride_kn, stride_vn, offs_d,
                            a_lo, a_full, P, E, S, W, Nk, qk_scale, bias_rows, in_m, REL_E,
                            BLOCK_N, HEAD_DIM, HEAD_DIM_PAD, False, DOT_PRECISION, HAS_BIAS)  # fmt: skip
     acc, l_i, m_i = _tiles(acc, l_i, m_i, q, q_abs, k_base, v_base, stride_kn, stride_vn, offs_d,
                            a_full, a_end, P, E, S, W, Nk, qk_scale, bias_rows, in_m, REL_E,
-                           BLOCK_N, HEAD_DIM, HEAD_DIM_PAD, True, DOT_PRECISION, HAS_BIAS)  # fmt: skip
+                           BLOCK_N, HEAD_DIM, HEAD_DIM_PAD, True, DOT_PRECISION, HAS_BIAS, HAS_PAD)  # fmt: skip
     # window range: masked lower edge, unmasked interior, masked causal edge
     acc, l_i, m_i = _tiles(acc, l_i, m_i, q, q_abs, k_base, v_base, stride_kn, stride_vn, offs_d,
                            b_start, b_full_lo, P, E, S, W, Nk, qk_scale, bias_rows, in_m, REL_E,
-                           BLOCK_N, HEAD_DIM, HEAD_DIM_PAD, True, DOT_PRECISION, HAS_BIAS)  # fmt: skip
+                           BLOCK_N, HEAD_DIM, HEAD_DIM_PAD, True, DOT_PRECISION, HAS_BIAS, HAS_PAD)  # fmt: skip
     acc, l_i, m_i = _tiles(acc, l_i, m_i, q, q_abs, k_base, v_base, stride_kn, stride_vn, offs_d,
                            b_full_lo, b_full_hi, P, E, S, W, Nk, qk_scale, bias_rows, in_m, REL_E,
                            BLOCK_N, HEAD_DIM, HEAD_DIM_PAD, False, DOT_PRECISION, HAS_BIAS)  # fmt: skip
     acc, l_i, m_i = _tiles(acc, l_i, m_i, q, q_abs, k_base, v_base, stride_kn, stride_vn, offs_d,
                            b_full_hi, b_end, P, E, S, W, Nk, qk_scale, bias_rows, in_m, REL_E,
-                           BLOCK_N, HEAD_DIM, HEAD_DIM_PAD, True, DOT_PRECISION, HAS_BIAS)  # fmt: skip
+                           BLOCK_N, HEAD_DIM, HEAD_DIM_PAD, True, DOT_PRECISION, HAS_BIAS, HAS_PAD)  # fmt: skip
 
     # ---- epilogue: rows with no allowed key (incl. pad queries) -> out 0, lse -inf
     empty = l_i == 0.0
@@ -350,6 +357,11 @@ def _bias_arg(rel_bias: torch.Tensor | None, q: torch.Tensor, scale: float):
     return raw, (raw.stride(0), raw.stride(1), raw.stride(2)), raw.shape[-1]
 
 
+def _has_padding(kv_start) -> bool:
+    """Compile the padding code? Only for a tensor or a nonzero int (no sync)."""
+    return kv_start is not None and not (isinstance(kv_start, int) and kv_start == 0)
+
+
 def _per_seq(x: IntOrTensor, B: int, device) -> torch.Tensor:
     """int / 0-d / 1-element / ``[B]`` -> contiguous int32 ``[B]`` on device."""
     t = torch.as_tensor(x, device=device).to(torch.int32)
@@ -369,7 +381,7 @@ def prefix_sliding_attention_fwd(
     window_size: int,
     q_start: IntOrTensor | None = None,
     num_evicted: IntOrTensor = 0,
-    kv_start: IntOrTensor = 0,
+    kv_start: IntOrTensor | None = 0,
     scale: float | None = None,
     config: dict | None = None,
     split_full: bool = True,
@@ -414,10 +426,12 @@ def prefix_sliding_attention_fwd(
     q, k, v = (t if t.stride(-1) == 1 else t.contiguous() for t in (q, k, v))
 
     if q_start is None:
-        validate_layout(Nq, Nk, prefix_length, window_size, num_evicted, kv_start)
+        validate_layout(Nq, Nk, prefix_length, window_size, num_evicted, 0 if kv_start is None else kv_start)
         q_start = default_q_start(Nq, Nk, prefix_length, num_evicted)
     dev = q.device
-    P_t, E_t, qs_t, S_t = (_per_seq(x, B, dev) for x in (prefix_length, num_evicted, q_start, kv_start))
+    P_t, E_t, qs_t = (_per_seq(x, B, dev) for x in (prefix_length, num_evicted, q_start))
+    has_pad = _has_padding(kv_start)
+    S_t = _per_seq(kv_start, B, dev) if has_pad else P_t  # dummy pointer when unpadded (never read)
     scale = 1.0 / math.sqrt(D) if scale is None else scale
 
     bias_raw, bias_strides, rel_e = _bias_arg(rel_bias, q, scale)
@@ -446,6 +460,7 @@ def prefix_sliding_attention_fwd(
         # "tf32" would be faster but fails the tight fp32 tests).
         DOT_PRECISION="ieee",
         HAS_BIAS=rel_bias is not None,
+        HAS_PAD=has_pad,
     )
     if config is None:
         grid = lambda META: (triton.cdiv(Nq, META["BLOCK_M"]), B * Hq)  # noqa: E731

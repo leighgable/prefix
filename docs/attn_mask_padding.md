@@ -1,6 +1,6 @@
 # Handoff: padding support (`kv_start`) in the prefix sliding kernels
 
-Status: **milestones 1–5 done** (see "Progress" at the end).
+Status: **all milestones (1–6) done** (see "Progress" at the end).
 Originally: Written at the end of a session in the llung
 repo (`~/Code/llung`), which consumes this repo for `LatentLM`'s
 attention. Decisions below are made — implement, don't re-litigate.
@@ -352,6 +352,56 @@ Run the relevant tests after each one, and the full suite at the end.
 - Mutation checks (shift, roll, HF shift, cache shift, mask backend shift,
   graph positions, sketch kv_start) are all caught.
 - Baseline is now 631 passed + 2 skipped (this env); llung env 599 passed.
+
+**Milestone 6 (benchmarks): done.** `bench/bench_padding.py` (docstring
+has the exact commands): `speed` (padded batches), `regression` + `compare`
+(S = 0, old vs new checkout).
+- Kernel changes made here (all bit-for-bit at S = 0, re-verified):
+  - `fwd.py` / `bwd.py`: constexpr `HAS_PAD` (launcher: `kv_start` is a
+    tensor or a nonzero int). Without padding, `S = 0` is a constant and
+    the per-element `k_abs >= S` compare is not compiled, so the unpadded
+    kernels are the pre-padding loop structure. (Measured: that compare
+    alone cost ~2-5% in all-masked tiles: the backward and `split_full=False`.)
+  - `ops.py`: `kv_start: Optional[Tensor]` in both op schemas; the public
+    op passes None for `kv_start=0`, so unpadded calls get `HAS_PAD=False`.
+  - `decode.py`: constexpr `SKIP_MASKED` (`skip_masked_tiles=None`: on
+    iff `kv_start` given): load a tile's slot positions first and skip the
+    K/V loads + dots when no query can see any slot (pad slots; prefix
+    slots past a row's prefix and out of the window). Exact no-op on the
+    result. Off without padding (the branch only delays the K/V loads,
+    measured +2-4% at W=8192). `integration._dispatch` passes the ring's
+    `kv_start` only when the cache has padding.
+  - New bitwise tests: zeros-tensor `kv_start` (padding-compiled) ==
+    unpadded, fwd and bwd; decode skip on == off.
+- **S = 0, no regression.** Autotune keys, candidate configs, pruning and
+  decode split choice are textually identical to `8c43ed9` (pre-padding).
+  Timings, 5 interleaved old/new runs, medians (Qwen2.5-1.5B heads, bf16,
+  P=128, W=1024, n = 2048 / 8192; fixed tile configs + autotuned; fwd, bwd,
+  op fwd+bwd, decode W = 512 / 2048 / 8192): geometric mean new/old
+  **0.981**, every new median inside the old runs' range (range of ratios
+  0.87-1.05; noise on this iGPU is ~+-5%). The backward autotune picks are
+  identical; the forward's differ between the old and new tuning caches
+  (equivalent candidates within noise; the autotuned timings are 0.95-0.98).
+- **Padded batches (speedup from skipped tiles).** B=4 rows of n, 3n/4,
+  n/2, n/4 (37.5% padding), same heads, P=128 real tokens, W=1024, 3 runs:
+
+  | n=8192 | padded vs no skipping | ideal |
+  |---|---|---|
+  | fwd | 1.44-1.62x faster | 1.67x |
+  | fwd+bwd | 1.52-1.69x faster | 1.67x |
+
+  n=2048: fwd 1.42-1.69x, fwd+bwd 1.68-1.86x (ideal 1.96x). "No
+  skipping" = `kv_start=0`, `prefix_length=P`: an unpadded batch of
+  full-length rows. The padded batch costs about the same as running each
+  row unpadded on its own (0.85-1.14x; ~10% slower at n=8192, where the
+  separate calls get their own autotuned tiles). flex_attention with the
+  same padding BlockMask: 9-13x slower than ours; dense SDPA + mask: 20-60x
+  (n=2048; its backward OOMs at 8192).
+- **Decode with padding:** the ring's prefix region grows to max(prefix)
+  slots (milestone 4); with `SKIP_MASKED` a padded decode step costs
+  +1% (n=2048) to +14% (n=8192, max S = 6144) over an unpadded one, down
+  from +52% when pad slots were scanned.
+- Baseline is now 638 passed + 2 skipped (this env); llung env 606 passed.
 
 **llung env failures: resolved by pinning llung to transformers 5.22.2**
 (`transformers==5.22.2` in llung's `pyproject.toml` / `uv.lock`, same as

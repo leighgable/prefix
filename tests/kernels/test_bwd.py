@@ -651,3 +651,22 @@ def test_q_tile_range_mirrors_reference(cfg: TileConfig) -> None:
     for n, (lo, hi) in enumerate(out.tolist()):
         ref = list(q_block_range(n, **cfg.kwargs()))
         assert list(range(lo, hi)) == ref, f"n={n}: kernel [{lo}, {hi}) != reference {ref}"
+
+
+@pytest.mark.parametrize("name", ["train_basic", "chunk_per_seq_E"])
+def test_padding_variant_with_zero_padding_is_bitwise_identical(name: str) -> None:
+    """Gradients from the padding-compiled kernels (zeros kv_start) == unpadded, exactly."""
+    case = next(c for c in CASES if c.name == name)
+    q, k, v, kw = make_inputs(case, dtype=torch.bfloat16, device="cuda")
+    bias = torch.randn(*q.shape[:3], 33, generator=torch.Generator().manual_seed(2)).cuda()
+    do, dlse = _upstream(q, with_dlse=True)
+    zeros = torch.zeros(case.batch, dtype=torch.int32, device="cuda")
+    c = _cfg(32, 32, 4)
+    out = {}
+    for pad in (None, zeros):
+        extra = {} if pad is None else {"kv_start": pad}
+        o, lse, st = prefix_sliding_attention_fwd(q, k, v, **kw, **extra, rel_bias=bias, config=c, return_stats=True)
+        out[pad is None] = prefix_sliding_attention_bwd(do, q, k, v, o, lse, **kw, **extra, dlse=dlse, stats=st,
+                                                        rel_bias=bias, config_dkdv=c, config_dq=c)  # fmt: skip
+    for a, b in zip(out[True], out[False]):
+        assert torch.equal(a, b)

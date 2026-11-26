@@ -437,3 +437,19 @@ def test_schedule_mirrors_reference(cfg: TileConfig, split_full: bool) -> None:
     for m, plan in enumerate(got):
         ref = fwd_schedule(m, **cfg.kwargs(), split_full=split_full)
         assert plan == [(list(t), masked) for t, masked in ref], f"m={m}: kernel {plan} != reference {ref}"
+
+
+@pytest.mark.parametrize("name", ["train_basic", "chunk_per_seq_E", "train_P_block_pm1"])
+def test_padding_variant_with_zero_padding_is_bitwise_identical(name: str) -> None:
+    """kv_start as a zeros tensor compiles the padding code (HAS_PAD); it must
+    give exactly the unpadded kernel's results (incl. a relative bias)."""
+    case = next(c for c in CASES if c.name == name)
+    q, k, v, kw = make_inputs(case, dtype=torch.bfloat16, device="cuda")
+    bias = _profile(q, 33)
+    zeros = torch.zeros(case.batch, dtype=torch.int32, device="cuda")
+    for rb in (None, bias):
+        plain = prefix_sliding_attention_fwd(q, k, v, **kw, config=FIXED, rel_bias=rb, return_stats=True)
+        padded = prefix_sliding_attention_fwd(q, k, v, **kw, config=FIXED, rel_bias=rb, return_stats=True,
+                                              kv_start=zeros)  # fmt: skip
+        for a, b in zip(plain, padded):
+            assert torch.equal(a, b)

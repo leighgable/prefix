@@ -318,3 +318,21 @@ def test_padded_row_equals_unpadded_row() -> None:
                                              window_size=W, q_start=S + n_real, kv_start=S)  # fmt: skip
     out, lse = prefix_sliding_decode(q, k, v, k_positions=pos.cuda(), prefix_length=P, window_size=W, q_start=n_real)
     assert max_abs_err(out_pad, out) < FP32_ATOL and max_abs_err(lse_pad, lse) < FP32_ATOL
+
+
+@pytest.mark.parametrize("splits", [1, 3])
+def test_skip_masked_tiles_is_bitwise_identical(splits) -> None:
+    """Skipping fully masked slot tiles (on with padding) is an exact no-op:
+    same bits as scanning them, padded or not, with a relative bias."""
+    P, W, chunk, n0, Q = 20, 40, 4, 300, 3
+    S = torch.tensor([0, 37, 120])
+    pos = ring_positions(P + int(S.max()), W, chunk, n0 + Q)
+    q, k, v = _inputs(3, 6, 2, Q, pos.numel(), 32, torch.bfloat16)
+    bias = torch.randn(*q.shape[:3], 50, generator=torch.Generator().manual_seed(1)).cuda()
+    for kv in (S, torch.zeros(3, dtype=torch.long)):
+        kw = dict(k_positions=pos.cuda(), prefix_length=(kv + P).cuda(), window_size=W, q_start=n0,
+                  kv_start=kv.cuda(), num_splits=splits, block_n=16, rel_bias=bias)  # fmt: skip
+        on = prefix_sliding_decode(q, k, v, **kw, skip_masked_tiles=True)
+        off = prefix_sliding_decode(q, k, v, **kw, skip_masked_tiles=False)
+        for a, b in zip(on, off):
+            assert torch.equal(a, b)

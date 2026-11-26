@@ -56,6 +56,7 @@ def _decode_fwd(
     HEAD_DIM: tl.constexpr, HEAD_DIM_PAD: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
     SPLIT: tl.constexpr, DOT_PRECISION: tl.constexpr, HAS_BIAS: tl.constexpr = False,
+    SKIP_MASKED: tl.constexpr = False,
 ):  # fmt: skip
     pid_bh = tl.program_id(0)  # b * Hkv + kvh
     pid_s = tl.program_id(1)  # split
@@ -92,30 +93,39 @@ def _decode_fwd(
     for n0 in range(start, end, BLOCK_N):
         offs_n = n0 + tl.arange(0, BLOCK_N)
         in_n = offs_n < end
-        k_t = tl.load(k_base + offs_n[None, :] * stride_kn + offs_d[:, None],
-                      mask=in_n[None, :] & in_d[:, None], other=0.0)  # fmt: skip
-        v = tl.load(v_base + offs_n[:, None] * stride_vn + offs_d[None, :],
-                    mask=in_n[:, None] & in_d[None, :], other=0.0)  # fmt: skip
         k_abs = tl.load(KPos + b * stride_pb + offs_n, mask=in_n, other=-1)
-
-        qk = tl.dot(q, k_t, input_precision=DOT_PRECISION)  # raw scores [BM, BN]
-        if HAS_BIAS:  # relative-bias profile, raw units, by absolute distance
-            dist = q_abs[:, None] - k_abs[None, :]
-            in_rng = (dist >= 0) & (dist < REL_E) & (k_abs >= 0)[None, :] & valid_row[:, None]
-            qk += tl.load(bias_rows[:, None] + dist, mask=in_rng, other=0.0).to(tl.float32)
         allowed = (k_abs[None, :] >= k_lo) & (k_abs[None, :] <= q_abs[:, None]) & (
             (k_abs[None, :] < P) | (k_abs[None, :] > q_abs[:, None] - W)
         )
-        qk = tl.where(allowed, qk, float("-inf"))
-        # online softmax, scale applied to (s - max): exact for the max element
-        m_new = tl.maximum(m_i, tl.max(qk, 1))
-        m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
-        p = tl.math.exp2((qk - m_safe[:, None]) * qk_scale)
-        alpha = tl.math.exp2((m_i - m_safe) * qk_scale)
-        l_i = l_i * alpha + tl.sum(p, 1)
-        acc = acc * alpha[:, None]
-        acc = tl.dot(p.to(v.dtype), v, acc, input_precision=DOT_PRECISION)
-        m_i = m_new
+        # SKIP_MASKED (with left padding): skip tiles no query here can see (pad
+        # slots, prefix slots past this row's prefix and out of the window); the
+        # positions are a few ints, K/V the traffic. A fully masked tile would be
+        # an exact no-op (x1, +0) anyway. Off without padding: every valid slot
+        # is visible then, and the branch would only delay the K/V loads.
+        if SKIP_MASKED:
+            visible = tl.max(tl.max(allowed.to(tl.int32), 1), 0) > 0
+        else:
+            visible = True
+        if visible:
+            k_t = tl.load(k_base + offs_n[None, :] * stride_kn + offs_d[:, None],
+                          mask=in_n[None, :] & in_d[:, None], other=0.0)  # fmt: skip
+            v = tl.load(v_base + offs_n[:, None] * stride_vn + offs_d[None, :],
+                        mask=in_n[:, None] & in_d[None, :], other=0.0)  # fmt: skip
+            qk = tl.dot(q, k_t, input_precision=DOT_PRECISION)  # raw scores [BM, BN]
+            if HAS_BIAS:  # relative-bias profile, raw units, by absolute distance
+                dist = q_abs[:, None] - k_abs[None, :]
+                in_rng = (dist >= 0) & (dist < REL_E) & (k_abs >= 0)[None, :] & valid_row[:, None]
+                qk += tl.load(bias_rows[:, None] + dist, mask=in_rng, other=0.0).to(tl.float32)
+            qk = tl.where(allowed, qk, float("-inf"))
+            # online softmax, scale applied to (s - max): exact for the max element
+            m_new = tl.maximum(m_i, tl.max(qk, 1))
+            m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
+            p = tl.math.exp2((qk - m_safe[:, None]) * qk_scale)
+            alpha = tl.math.exp2((m_i - m_safe) * qk_scale)
+            l_i = l_i * alpha + tl.sum(p, 1)
+            acc = acc * alpha[:, None]
+            acc = tl.dot(p.to(v.dtype), v, acc, input_precision=DOT_PRECISION)
+            m_i = m_new
 
     empty = l_i == 0.0
     acc = acc / tl.where(empty, 1.0, l_i)[:, None]
@@ -212,6 +222,7 @@ def prefix_sliding_decode(
     block_n: int = 64,
     num_warps: int = 4,
     rel_bias: torch.Tensor | None = None,
+    skip_masked_tiles: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Attention of a few new queries over a cache with arbitrary slot order.
 
@@ -229,6 +240,9 @@ def prefix_sliding_decode(
         num_splits: split-KV factor (default: ``choose_num_splits``).
         rel_bias: optional relative-bias profile ``[B, Hq, Q, E]`` (natural
             units) for the new queries, indexed by ``q_pos - k_pos``.
+        skip_masked_tiles: skip slot tiles no query can see (no K/V loads).
+            Default: on when ``kv_start`` is given (padding: pad slots and the
+            enlarged prefix region are mostly masked), else off (the plain loop).
 
     Returns:
         ``out [B, Hq, Q, D]`` (a view of a ``[B, Q, Hq, D]`` buffer, like the
@@ -282,7 +296,9 @@ def prefix_sliding_decode(
         *bias_strides, rel_e,
         Hkv, group, Q_len, int(window_size), qk_scale, keys_per_split,
         HEAD_DIM=D, HEAD_DIM_PAD=head_pad, BLOCK_M=block_m, BLOCK_N=block_n,
-        SPLIT=splits > 1, DOT_PRECISION="ieee", HAS_BIAS=rel_bias is not None, num_warps=num_warps, num_stages=1,
+        SPLIT=splits > 1, DOT_PRECISION="ieee", HAS_BIAS=rel_bias is not None,
+        SKIP_MASKED=(not (isinstance(kv_start, int) and kv_start == 0)) if skip_masked_tiles is None else skip_masked_tiles,
+        num_warps=num_warps, num_stages=1,
     )  # fmt: skip
     if splits > 1:
         _decode_combine[(num_rows,)](

@@ -13,6 +13,8 @@ the backward uses to recompute the softmax exactly (see ``bwd.py``).
 Both have fake (meta) implementations for tracing. Per-sequence ``P``, ``E``,
 ``q_start`` and ``kv_start`` travel as int32 tensors (non-differentiable
 inputs), so a compiled graph does not recompile when they change.
+``kv_start`` is None without padding (the kernels then compile without the
+padding code).
 
 Note: no ``from __future__ import annotations`` here — ``custom_op`` infers the
 op schema from the annotations at decoration time.
@@ -32,7 +34,7 @@ from .reference import IntOrTensor, default_q_start, validate_layout
 @torch.library.custom_op("prefix_sliding::attention", mutates_args=(), device_types="cuda")
 def _attention(
     q: Tensor, k: Tensor, v: Tensor, prefix_length: Tensor, num_evicted: Tensor, q_start: Tensor,
-    kv_start: Tensor, window_size: int, scale: float, rel_bias: Optional[Tensor] = None,
+    kv_start: Optional[Tensor], window_size: int, scale: float, rel_bias: Optional[Tensor] = None,
 ) -> tuple[Tensor, Tensor, Tensor]:  # fmt: skip
     return prefix_sliding_attention_fwd(
         q, k, v, prefix_length=prefix_length, window_size=window_size, q_start=q_start,
@@ -50,7 +52,7 @@ def _(q, k, v, prefix_length, num_evicted, q_start, kv_start, window_size, scale
 @torch.library.custom_op("prefix_sliding::attention_backward", mutates_args=(), device_types="cuda")
 def _attention_backward(
     dout: Tensor, dlse: Optional[Tensor], q: Tensor, k: Tensor, v: Tensor, out: Tensor, lse: Tensor,
-    stats: Tensor, prefix_length: Tensor, num_evicted: Tensor, q_start: Tensor, kv_start: Tensor,
+    stats: Tensor, prefix_length: Tensor, num_evicted: Tensor, q_start: Tensor, kv_start: Optional[Tensor],
     window_size: int, scale: float, rel_bias: Optional[Tensor] = None,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:  # fmt: skip
     """Returns (dq, dk, dv, d_rel_bias); d_rel_bias is empty without a bias."""
@@ -146,7 +148,7 @@ def prefix_sliding_attention(
         _per_seq_tensor(prefix_length, B, q.device),
         _per_seq_tensor(num_evicted, B, q.device),
         _per_seq_tensor(q_start, B, q.device),
-        _per_seq_tensor(kv_start, B, q.device),
+        None if isinstance(kv_start, int) and kv_start == 0 else _per_seq_tensor(kv_start, B, q.device),
         int(window_size), scale, rel_bias,
     )  # fmt: skip
     return (out, lse) if return_lse else out
