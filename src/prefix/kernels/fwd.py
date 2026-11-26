@@ -6,7 +6,7 @@ Each program walks only the key tiles its queries can see (prefix + window,
 
 Semantics are defined by ``reference.attention_ref``; see that module for the
 mask, the two KV layouts (contiguous / evicted ``[prefix ++ tail]``) and the
-per-sequence ``P``, ``E``, ``q_start``.
+per-sequence ``P``, ``E``, ``q_start`` and ``kv_start`` (left padding).
 
 Public entry point: ``prefix_sliding_attention_fwd``.
 """
@@ -33,8 +33,15 @@ _IS_HIP = triton.runtime.driver.active.get_current_target().backend == "hip"
 
 
 @triton.jit
-def kv_tile_ranges(row_lo, qs, P, E, W, Nq, Nk, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
-    """Key tiles a query tile must visit: prefix ``[0, a_end)`` and window
+def first_at_or_after(a, P, E):
+    """Smallest stored index whose absolute position is >= a
+    (``reference._stored_first_at_or_after``)."""
+    return tl.where(a <= 0, 0, tl.where(a < P, a, tl.maximum(P, a - E)))
+
+
+@triton.jit
+def kv_tile_ranges(row_lo, qs, P, E, S, W, Nq, Nk, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
+    """Key tiles a query tile must visit: prefix ``[a_start, a_end)`` and window
     ``[b_start, b_end)``. Mirrors ``reference.kv_block_ranges`` exactly (shared
     by the forward and dQ kernels). All ``//`` operands are >= 0."""
     row_hi = tl.minimum(row_lo + BLOCK_M, Nq)
@@ -43,15 +50,50 @@ def kv_tile_ranges(row_lo, qs, P, E, W, Nq, Nk, BLOCK_M: tl.constexpr, BLOCK_N: 
     # s_hi = #stored keys with abs position <= qa_hi (causal bound)
     cnt = tl.where(qa_hi < P, qa_hi + 1, tl.where(qa_hi < P + E, P, qa_hi - E + 1))
     s_hi = tl.minimum(Nk, tl.where(qa_hi < 0, 0, cnt))
-    # s_lo = first stored key with abs position >= qa_lo - W + 1 (window bound)
-    a = qa_lo - W + 1
-    s_lo = tl.where(a <= 0, 0, tl.where(a < P, a, tl.maximum(P, a - E)))
+    s_lo = first_at_or_after(qa_lo - W + 1, P, E)  # window bound for the first query
+    s_0 = first_at_or_after(S, P, E)  # padding bound: first real key
     pre_hi = tl.minimum(P, s_hi)
-    a_end = tl.cdiv(pre_hi, BLOCK_N)
-    b_start = tl.maximum(s_lo // BLOCK_N, a_end)
-    b_end = tl.where(s_lo < s_hi, tl.cdiv(s_hi, BLOCK_N), b_start)
+    has_pre = s_0 < pre_hi
+    a_start = tl.where(has_pre, s_0 // BLOCK_N, 0)
+    a_end = tl.where(has_pre, tl.cdiv(pre_hi, BLOCK_N), 0)
+    w_lo = tl.maximum(s_lo, s_0)
+    b_start = tl.maximum(w_lo // BLOCK_N, a_end)
+    b_end = tl.where(w_lo < s_hi, tl.cdiv(s_hi, BLOCK_N), b_start)
     b_end = tl.maximum(b_end, b_start)
-    return a_end, b_start, b_end
+    return a_start, a_end, b_start, b_end
+
+
+@triton.jit
+def fwd_segments(row_lo, qs, P, E, S, W, Nq, Nk, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, SPLIT_FULL: tl.constexpr):
+    """The forward's six-segment loop plan for one query tile. Mirrors
+    ``reference.fwd_schedule`` line by line (checked against it in
+    ``tests/kernels/test_fwd.py::test_schedule_mirrors_reference``)::
+
+        prefix: [a_start, a_lo) masked | [a_lo, a_full) unmasked | [a_full, a_end) masked
+        window: [b_start, b_full_lo) masked | [b_full_lo, b_full_hi) unmasked | [b_full_hi, b_end) masked
+    """
+    a_start, a_end, b_start, b_end = kv_tile_ranges(row_lo, qs, P, E, S, W, Nq, Nk, BLOCK_M, BLOCK_N)
+    a_lo = a_start
+    a_full = a_start
+    b_full_lo = b_end
+    b_full_hi = b_end
+    if SPLIT_FULL:
+        rows_full = row_lo + BLOCK_M <= Nq
+        q_min = qs + row_lo
+        q_max = qs + row_lo + BLOCK_M - 1
+        s_0 = first_at_or_after(S, P, E)
+        al = tl.minimum(tl.maximum(tl.cdiv(s_0, BLOCK_N), a_start), a_end)
+        af = tl.minimum(tl.minimum(P // BLOCK_N, Nk // BLOCK_N), tl.maximum(q_min + 1, 0) // BLOCK_N)
+        af = tl.minimum(tl.maximum(af, al), a_end)
+        bl = tl.cdiv(tl.maximum(tl.maximum(P, q_max - W - E + 1), s_0), BLOCK_N)
+        bh = tl.minimum(tl.maximum(q_min - E + 1, 0) // BLOCK_N, Nk // BLOCK_N)
+        bl = tl.minimum(tl.maximum(bl, b_start), b_end)
+        bh = tl.minimum(tl.maximum(bh, bl), b_end)
+        a_lo = tl.where(rows_full, al, a_start)
+        a_full = tl.where(rows_full, af, a_start)
+        b_full_lo = tl.where(rows_full, bl, b_end)
+        b_full_hi = tl.where(rows_full, bh, b_end)
+    return a_start, a_lo, a_full, a_end, b_start, b_full_lo, b_full_hi, b_end
 
 
 @triton.jit
@@ -59,12 +101,16 @@ def _tiles(
     acc, l_i, m_i, q, q_abs,
     k_base, v_base, stride_kn, stride_vn,
     offs_d, lo, hi,
-    P, E, W, Nk, qk_scale,
+    P, E, S, W, Nk, qk_scale,
     bias_rows, in_m, REL_E,
     BLOCK_N: tl.constexpr, HEAD_DIM: tl.constexpr, HEAD_DIM_PAD: tl.constexpr,
     MASKED: tl.constexpr, DOT_PRECISION: tl.constexpr, HAS_BIAS: tl.constexpr,
 ):  # fmt: skip
     """Online-softmax over key tiles [lo, hi). MASKED=False only for full tiles.
+
+    Rows that see no key in a tile (pad queries, or nothing allowed yet) keep
+    ``m = -inf``; ``m_safe`` keeps their ``exp2`` arguments at ``-inf`` (p = 0,
+    alpha = 0), never ``-inf - -inf``.
 
     HAS_BIAS: add ``bias_rows[i] + (q_pos - k_pos)`` (a relative-bias profile
     row per query, already in raw-score units) when the distance is in
@@ -111,7 +157,7 @@ def _tiles(
             allowed = (k_abs[None, :] <= q_abs[:, None]) & (
                 (k_abs[None, :] < P) | (k_abs[None, :] > q_abs[:, None] - W)
             )
-            allowed = allowed & (offs_n < Nk)[None, :]
+            allowed = allowed & ((offs_n < Nk) & (k_abs >= S))[None, :]  # in bounds, not padding
             qk = tl.where(allowed, qk, float("-inf"))
 
         m_new = tl.maximum(m_i, tl.max(qk, 1))
@@ -131,7 +177,7 @@ def _tiles(
 @triton.jit(do_not_specialize=["Hq", "GROUP", "Nq", "Nk", "W", "N_BUCKET", "stride_lb", "stride_lh",
                                "stride_bb", "stride_bh", "stride_bm", "REL_E"])
 def _prefix_sliding_fwd(
-    Q, K, V, Out, Lse, RowMax, RowLog2Sum, Prefix, Evicted, QStart, Bias,
+    Q, K, V, Out, Lse, RowMax, RowLog2Sum, Prefix, Evicted, QStart, KvStart, Bias,
     stride_qb, stride_qh, stride_qm,
     stride_kb, stride_kh, stride_kn,
     stride_vb, stride_vh, stride_vn,
@@ -152,6 +198,7 @@ def _prefix_sliding_fwd(
     P = tl.load(Prefix + b)
     E = tl.load(Evicted + b)
     qs = tl.load(QStart + b)
+    S = tl.load(KvStart + b)
 
     row_lo = pid_m * BLOCK_M
     offs_m = row_lo + tl.arange(0, BLOCK_M)
@@ -167,49 +214,37 @@ def _prefix_sliding_fwd(
     bias_rows = Bias + b * stride_bb + h * stride_bh + offs_m * stride_bm
 
     # ---- tile schedule: mirrors reference.kv_block_ranges / fwd_schedule ----
-    a_end, b_start, b_end = kv_tile_ranges(row_lo, qs, P, E, W, Nq, Nk, BLOCK_M, BLOCK_N)
-    qa_lo = qs + row_lo
+    a_start, a_lo, a_full, a_end, b_start, b_full_lo, b_full_hi, b_end = fwd_segments(
+        row_lo, qs, P, E, S, W, Nq, Nk, BLOCK_M, BLOCK_N, SPLIT_FULL
+    )
 
-    a_full = a_end * 0
-    b_full_lo = b_end
-    b_full_hi = b_end
-    if SPLIT_FULL:
-        rows_full = row_lo + BLOCK_M <= Nq
-        q_min = qa_lo
-        q_max = qs + row_lo + BLOCK_M - 1
-        af = tl.minimum(tl.minimum(P // BLOCK_N, Nk // BLOCK_N), tl.maximum(q_min + 1, 0) // BLOCK_N)
-        af = tl.minimum(af, a_end)
-        bl = tl.cdiv(tl.maximum(P, q_max - W - E + 1), BLOCK_N)
-        bh = tl.minimum(tl.maximum(q_min - E + 1, 0) // BLOCK_N, Nk // BLOCK_N)
-        bl = tl.minimum(tl.maximum(bl, b_start), b_end)
-        bh = tl.minimum(tl.maximum(bh, bl), b_end)
-        a_full = tl.where(rows_full, af, 0)
-        b_full_lo = tl.where(rows_full, bl, b_end)
-        b_full_hi = tl.where(rows_full, bh, b_end)
-
-    # ---- online softmax over the five segments ------------------------------
+    # ---- online softmax over the six segments -------------------------------
     m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, HEAD_DIM_PAD], dtype=tl.float32)
-    # prefix range: unmasked interior, then masked edge
+    # prefix range: masked padding edge (<= 1 tile, empty without padding),
+    # unmasked interior, masked causal edge
     acc, l_i, m_i = _tiles(acc, l_i, m_i, q, q_abs, k_base, v_base, stride_kn, stride_vn, offs_d,
-                           0, a_full, P, E, W, Nk, qk_scale, bias_rows, in_m, REL_E,
+                           a_start, a_lo, P, E, S, W, Nk, qk_scale, bias_rows, in_m, REL_E,
+                           BLOCK_N, HEAD_DIM, HEAD_DIM_PAD, True, DOT_PRECISION, HAS_BIAS)  # fmt: skip
+    acc, l_i, m_i = _tiles(acc, l_i, m_i, q, q_abs, k_base, v_base, stride_kn, stride_vn, offs_d,
+                           a_lo, a_full, P, E, S, W, Nk, qk_scale, bias_rows, in_m, REL_E,
                            BLOCK_N, HEAD_DIM, HEAD_DIM_PAD, False, DOT_PRECISION, HAS_BIAS)  # fmt: skip
     acc, l_i, m_i = _tiles(acc, l_i, m_i, q, q_abs, k_base, v_base, stride_kn, stride_vn, offs_d,
-                           a_full, a_end, P, E, W, Nk, qk_scale, bias_rows, in_m, REL_E,
+                           a_full, a_end, P, E, S, W, Nk, qk_scale, bias_rows, in_m, REL_E,
                            BLOCK_N, HEAD_DIM, HEAD_DIM_PAD, True, DOT_PRECISION, HAS_BIAS)  # fmt: skip
     # window range: masked lower edge, unmasked interior, masked causal edge
     acc, l_i, m_i = _tiles(acc, l_i, m_i, q, q_abs, k_base, v_base, stride_kn, stride_vn, offs_d,
-                           b_start, b_full_lo, P, E, W, Nk, qk_scale, bias_rows, in_m, REL_E,
+                           b_start, b_full_lo, P, E, S, W, Nk, qk_scale, bias_rows, in_m, REL_E,
                            BLOCK_N, HEAD_DIM, HEAD_DIM_PAD, True, DOT_PRECISION, HAS_BIAS)  # fmt: skip
     acc, l_i, m_i = _tiles(acc, l_i, m_i, q, q_abs, k_base, v_base, stride_kn, stride_vn, offs_d,
-                           b_full_lo, b_full_hi, P, E, W, Nk, qk_scale, bias_rows, in_m, REL_E,
+                           b_full_lo, b_full_hi, P, E, S, W, Nk, qk_scale, bias_rows, in_m, REL_E,
                            BLOCK_N, HEAD_DIM, HEAD_DIM_PAD, False, DOT_PRECISION, HAS_BIAS)  # fmt: skip
     acc, l_i, m_i = _tiles(acc, l_i, m_i, q, q_abs, k_base, v_base, stride_kn, stride_vn, offs_d,
-                           b_full_hi, b_end, P, E, W, Nk, qk_scale, bias_rows, in_m, REL_E,
+                           b_full_hi, b_end, P, E, S, W, Nk, qk_scale, bias_rows, in_m, REL_E,
                            BLOCK_N, HEAD_DIM, HEAD_DIM_PAD, True, DOT_PRECISION, HAS_BIAS)  # fmt: skip
 
-    # ---- epilogue: rows with no allowed key -> out 0, lse -inf --------------
+    # ---- epilogue: rows with no allowed key (incl. pad queries) -> out 0, lse -inf
     empty = l_i == 0.0
     acc = acc / tl.where(empty, 1.0, l_i)[:, None]
     log2_l = tl.math.log2(tl.where(empty, 1.0, l_i))
@@ -334,6 +369,7 @@ def prefix_sliding_attention_fwd(
     window_size: int,
     q_start: IntOrTensor | None = None,
     num_evicted: IntOrTensor = 0,
+    kv_start: IntOrTensor = 0,
     scale: float | None = None,
     config: dict | None = None,
     split_full: bool = True,
@@ -345,7 +381,9 @@ def prefix_sliding_attention_fwd(
     Args:
         q: ``[B, Hq, Nq, D]``; k, v: ``[B, Hkv, Nk, D]``. Any strides with a
             unit last dim (e.g. transformers' transposed views) — no copies.
-        prefix_length, num_evicted, q_start: int or per-sequence ``[B]`` tensor.
+        prefix_length, num_evicted, q_start, kv_start: int or per-sequence
+            ``[B]`` tensor. ``kv_start`` (S): keys at absolute positions < S are
+            left padding, never attended; queries before S are empty rows.
         config: force ``{"BLOCK_M", "BLOCK_N", "num_warps", "num_stages"}``
             (plus optional backend options like ``waves_per_eu``) instead of
             autotuning, e.g. ``config_dict(CONFIGS[0])``. Tests / debugging.
@@ -376,10 +414,10 @@ def prefix_sliding_attention_fwd(
     q, k, v = (t if t.stride(-1) == 1 else t.contiguous() for t in (q, k, v))
 
     if q_start is None:
-        validate_layout(Nq, Nk, prefix_length, window_size, num_evicted)
+        validate_layout(Nq, Nk, prefix_length, window_size, num_evicted, kv_start)
         q_start = default_q_start(Nq, Nk, prefix_length, num_evicted)
     dev = q.device
-    P_t, E_t, qs_t = (_per_seq(x, B, dev) for x in (prefix_length, num_evicted, q_start))
+    P_t, E_t, qs_t, S_t = (_per_seq(x, B, dev) for x in (prefix_length, num_evicted, q_start, kv_start))
     scale = 1.0 / math.sqrt(D) if scale is None else scale
 
     bias_raw, bias_strides, rel_e = _bias_arg(rel_bias, q, scale)
@@ -390,7 +428,7 @@ def prefix_sliding_attention_fwd(
         return (out, lse, stats) if return_stats else (out, lse)
 
     args = (
-        q, k, v, out, lse, stats[0], stats[1], P_t, E_t, qs_t, bias_raw,
+        q, k, v, out, lse, stats[0], stats[1], P_t, E_t, qs_t, S_t, bias_raw,
         q.stride(0), q.stride(1), q.stride(2),
         k.stride(0), k.stride(1), k.stride(2),
         v.stride(0), v.stride(1), v.stride(2),

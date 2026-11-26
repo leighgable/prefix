@@ -252,12 +252,13 @@ def _bwd_dq(
     q_abs = qs + offs_m
     bias_off = b * stride_bb + h * stride_bh + offs_m * stride_bm  # Bias and DBias share a layout
 
-    a_end, b_start, b_end = kv_tile_ranges(row_lo, qs, P, E, W, Nq, Nk, BLOCK_M, BLOCK_N)
+    S = P * 0  # TODO(milestone 3): load kv_start
+    a_start, a_end, b_start, b_end = kv_tile_ranges(row_lo, qs, P, E, S, W, Nq, Nk, BLOCK_M, BLOCK_N)
     k_base = K + b * stride_kb + kvh * stride_kh
     v_base = V + b * stride_vb + kvh * stride_vh
     dq = tl.zeros([BLOCK_M, HEAD_DIM_PAD], dtype=tl.float32)
     dq = _dq_tiles(dq, q, do, row_max, row_l2, delta, q_abs, in_m, k_base, v_base, stride_kn, stride_vn, offs_d, in_d,
-                   0, a_end, P, E, W, Nk, qk_scale, Bias + bias_off, DBias + bias_off, REL_E,
+                   a_start, a_end, P, E, W, Nk, qk_scale, Bias + bias_off, DBias + bias_off, REL_E,
                    BLOCK_N, DOT_PRECISION, HAS_BIAS)  # fmt: skip
     dq = _dq_tiles(dq, q, do, row_max, row_l2, delta, q_abs, in_m, k_base, v_base, stride_kn, stride_vn, offs_d, in_d,
                    b_start, b_end, P, E, W, Nk, qk_scale, Bias + bias_off, DBias + bias_off, REL_E,

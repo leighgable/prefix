@@ -22,13 +22,15 @@ and a compile takes seconds on this iGPU. Keep the number of distinct
 
 import pytest
 import torch
+import triton
+import triton.language as tl
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from prefix.kernels.fwd import CONFIGS, config_dict, prefix_sliding_attention_fwd
-from prefix.kernels.reference import attention_ref
-from prefix.kernels.strategies import KINDS, AttnShape, attn_shapes, examples
-from prefix.kernels.testing import CASES, AttnCase, assert_close_to_ref, make_inputs, max_abs_err
+from prefix.kernels.fwd import CONFIGS, config_dict, fwd_segments, prefix_sliding_attention_fwd
+from prefix.kernels.reference import _cdiv, attention_ref, fwd_schedule
+from prefix.kernels.strategies import KINDS, AttnShape, TileConfig, attn_shapes, examples, layouts
+from prefix.kernels.testing import CASES, PADDED_CASES, AttnCase, assert_close_to_ref, make_inputs, max_abs_err
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
@@ -141,10 +143,11 @@ def test_residue_sweep(config) -> None:
         _check_fp32(q, k, v, dict(prefix_length=p, window_size=W, num_evicted=E), f"evicted W={W}", config=cfg)
 
 
-def _draw(data, kinds, max_len, head_dims):
+def _draw(data, kinds, max_len, head_dims, padded=False):
     """Config first, then a problem biased toward *that* config's tile boundaries."""
     bm, bn, warps = data.draw(st.sampled_from(FORCED_CONFIGS), label="config")
-    s = data.draw(attn_shapes(kinds=kinds, max_len=max_len, head_dims=head_dims, blocks=(bm, bn)), label="shape")
+    shapes = attn_shapes(kinds=kinds, max_len=max_len, head_dims=head_dims, blocks=(bm, bn), padded=padded)
+    s = data.draw(shapes, label="shape")
     return s, _cfg(bm, bn, warps)
 
 
@@ -266,3 +269,171 @@ def test_rel_bias_random_layouts_fp32(data, E: int) -> None:
     bias = _profile(q, E, seed=s.seed)
     kw = dict(s.layout.ref_kwargs(), rel_bias=bias)
     _check_fp32(q, k, v, kw, f"{s} E={E}", config=config)
+
+
+# --------------------------------------------------------------------------
+# left padding (kv_start)
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32], ids=str)
+@pytest.mark.parametrize("case", PADDED_CASES, ids=str)
+def test_padded_cases(case: AttnCase, dtype) -> None:
+    q, k, v, kw = make_inputs(case, dtype=dtype, device="cuda")
+    check = _check_fp32 if dtype == torch.float32 else _check_low_precision
+    check(q, k, v, kw, case.name, config=FIXED)
+
+
+@pytest.mark.parametrize("name", ["pad_train_per_seq", "pad_chunk_q16", "pad_decode_q1"])
+def test_padded_autotuned(name: str) -> None:
+    case = next(c for c in PADDED_CASES if c.name == name)
+    q, k, v, kw = make_inputs(case, dtype=torch.bfloat16, device="cuda")
+    _check_low_precision(q, k, v, kw, case.name)
+
+
+@pytest.mark.parametrize("config", FORCED_CONFIGS, ids=lambda c: f"bm{c[0]}_bn{c[1]}")
+def test_padding_residue_sweep(config) -> None:
+    """Every padding bound S up to 2 * BLOCK_N + BLOCK_M + 1 (every residue mod
+    BLOCK_N and BLOCK_M), batched per sequence: S inside the prefix (callers'
+    layout, P = S + p), S past the prefix (in the tail), and with eviction S
+    inside the evicted gap and the tail. The padding-edge tile (and the first
+    unmasked tile after it) is only wrong at one specific alignment."""
+    bm, bn, warps = config
+    cfg = _cfg(bm, bn, warps)
+    g = torch.Generator().manual_seed(0)
+    S = torch.arange(0, 2 * bn + bm + 2)
+    B = len(S)
+    for W in (1, bn - 1, bn + 2, bm + bn):
+        n = 3 * bm + 2 * bn + W + 3
+        q, k, v = (torch.randn(B, 2, n, 16, generator=g).cuda() for _ in range(3))
+        for p in (0, 3, bn):  # real prefix after the pads
+            kw = dict(prefix_length=S + p, window_size=W, kv_start=S)
+            _check_fp32(q, k, v, kw, f"train W={W} P=S+{p}", config=cfg)
+        kw = dict(prefix_length=bn + 1, window_size=W, kv_start=S)  # S also past the prefix
+        _check_fp32(q, k, v, kw, f"train W={W} P={bn + 1}", config=cfg)
+        # evicted: prefix p, then E evicted positions, then the stored tail
+        p, E, q_len = bn + 1, bn + 3, bm + 3
+        kv_len = p + W - 1 + q_len
+        q = torch.randn(B, 2, q_len, 16, generator=g).cuda()
+        k, v = (torch.randn(B, 2, kv_len, 16, generator=g).cuda() for _ in range(2))
+        for shift in (0, p + E - 3):  # S in prefix / gap; and gap / tail
+            kw = dict(prefix_length=p, window_size=W, num_evicted=E, kv_start=S + shift)
+            _check_fp32(q, k, v, kw, f"evicted W={W} S+{shift}", config=cfg)
+
+
+@settings(max_examples=examples(1))
+@given(st.data(), st.one_of(st.none(), st.integers(1, 70)))
+def test_padded_random_layouts_fp32(data, rel_e) -> None:
+    s, config = _draw(data, KINDS, 150, (16, 32), padded=True)
+    q, k, v = _inputs(s, torch.float32)
+    kw = s.layout.ref_kwargs()
+    if rel_e is not None:
+        kw["rel_bias"] = _profile(q, rel_e, seed=s.seed)
+    _check_fp32(q, k, v, kw, f"{s} rel_e={rel_e}", config=config)
+
+
+@settings(max_examples=examples(0.25))
+@given(st.data())
+def test_padded_random_layouts_bf16(data) -> None:
+    s, config = _draw(data, KINDS, 150, (64,), padded=True)
+    q, k, v = _inputs(s, torch.bfloat16)
+    _check_low_precision(q, k, v, s.layout.ref_kwargs(), str(s), config=config)
+
+
+@settings(max_examples=examples(0.25))
+@given(st.data(), st.sampled_from([torch.float32, torch.bfloat16]), st.booleans())
+def test_pad_queries_are_empty_rows(data, dtype, split_full: bool) -> None:
+    """Pad queries (and any row with no allowed key): out exactly 0, lse -inf,
+    stats (M = +inf, log2 l = 0), no NaN anywhere. Huge scores too: the
+    online softmax must never compute -inf - -inf."""
+    s, config = _draw(data, KINDS, 80, (16,), padded=True)
+    q, k, v = _inputs(s, dtype)
+    q = q * 30  # scores ~1e2-1e3: exp overflow would show up as inf / NaN
+    kw = s.layout.ref_kwargs()
+    out, lse, stats = prefix_sliding_attention_fwd(q, k, v, **kw, config=config, split_full=split_full, return_stats=True)
+    _, ref_lse = attention_ref(q, k, v, **kw)
+    empty = torch.isneginf(ref_lse)
+    assert torch.equal(torch.isneginf(lse), empty)
+    assert (out[empty] == 0).all() and (stats[0][empty] == float("inf")).all() and (stats[1][empty] == 0).all()
+    assert not out.isnan().any() and not lse.isnan().any() and not stats.isnan().any()
+    assert torch.isfinite(out).all() and torch.isfinite(lse[~empty]).all()
+
+
+@pytest.mark.parametrize("name", ["pad_train", "pad_train_per_seq", "pad_chunk_q16"])
+def test_padded_batch_equals_unpadded_rows(name: str) -> None:
+    """Acceptance: each row of a left-padded batch == that row run unpadded
+    (the kernel against itself, fp32; tile alignment differs, so not bitwise)."""
+    case = next(c for c in PADDED_CASES if c.name == name)
+    q, k, v, kw = make_inputs(case, dtype=torch.float32, device="cuda")
+    out, lse = prefix_sliding_attention_fwd(q, k, v, **kw, config=FIXED)
+    S, P, E = (torch.as_tensor(kw[x]).expand(case.batch) for x in ("kv_start", "prefix_length", "num_evicted"))
+    train = case.q_len == case.kv_len
+    for b in range(case.batch):
+        s = int(S[b])
+        qb = q[b : b + 1, :, s:] if train else q[b : b + 1]
+        o_b, l_b = prefix_sliding_attention_fwd(
+            qb, k[b : b + 1, :, s:], v[b : b + 1, :, s:], prefix_length=int(P[b]) - s, num_evicted=int(E[b]),
+            window_size=case.window_size, config=FIXED,
+        )  # fmt: skip
+        rows = slice(s, None) if train else slice(None)
+        assert max_abs_err(out[b : b + 1, :, rows], o_b) < FP32_ATOL, f"{name} row {b} out"
+        assert max_abs_err(lse[b : b + 1, :, rows], l_b) < FP32_ATOL, f"{name} row {b} lse"
+        if train:
+            assert (out[b, :, :s] == 0).all() and torch.isneginf(lse[b, :, :s]).all()
+
+
+@pytest.mark.parametrize("name", ["pad_train", "pad_train_per_seq", "pad_chunk_no_evict"])
+def test_padded_split_full_matches_always_mask(name: str) -> None:
+    case = next(c for c in PADDED_CASES if c.name == name)
+    q, k, v, kw = make_inputs(case, dtype=torch.float32, device="cuda")
+    split, split_lse = prefix_sliding_attention_fwd(q, k, v, **kw, config=FIXED)
+    masked, masked_lse = prefix_sliding_attention_fwd(q, k, v, **kw, config=FIXED, split_full=False)
+    torch.testing.assert_close(split, masked, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(split_lse, masked_lse, rtol=1e-6, atol=1e-6)
+
+
+# --------------------------------------------------------------------------
+# the kernel's tile schedule == reference.fwd_schedule
+# --------------------------------------------------------------------------
+
+
+@triton.jit
+def _schedule_probe(Out, qs, P, E, S, W, Nq, Nk, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, SPLIT_FULL: tl.constexpr):
+    m = tl.program_id(0)
+    seg = fwd_segments(m * BLOCK_M, qs, P, E, S, W, Nq, Nk, BLOCK_M, BLOCK_N, SPLIT_FULL)
+    for i in tl.static_range(8):
+        tl.store(Out + m * 8 + i, seg[i])
+
+
+def _kernel_schedule(cfg: TileConfig, split_full: bool) -> list[list[tuple[list[int], bool]]]:
+    lay, bm, bn = cfg.layout, cfg.block_m, cfg.block_n
+    n_m = _cdiv(lay.q_len, bm)
+    out = torch.empty(n_m, 8, dtype=torch.int32, device="cuda")
+    _schedule_probe[(n_m,)](
+        out, lay.q_start, lay.prefix_length, lay.num_evicted, lay.kv_start, lay.window_size, lay.q_len, lay.kv_len,
+        BLOCK_M=bm, BLOCK_N=bn, SPLIT_FULL=split_full,
+    )  # fmt: skip
+    plans = []
+    for a0, al, af, ae, b0, bl, bh, be in out.tolist():
+        bounds = [(a0, al, True), (al, af, False), (af, ae, True), (b0, bl, True), (bl, bh, False), (bh, be, True)]
+        plans.append([(list(range(lo, hi)), masked) for lo, hi, masked in bounds])
+    return plans
+
+
+@st.composite
+def _kernel_tile_configs(draw):
+    bm, bn = draw(st.sampled_from([(16, 16), (32, 16), (16, 32), (64, 32)]))
+    return TileConfig(draw(layouts(blocks=(bm, bn), max_len=150, padded=True)), bm, bn)
+
+
+@settings(max_examples=examples(2))
+@given(_kernel_tile_configs(), st.booleans())
+def test_schedule_mirrors_reference(cfg: TileConfig, split_full: bool) -> None:
+    """Segment by segment, the Triton plan visits exactly the reference's
+    tiles with the same masked flag (the reference plan is proven exact in
+    test_block_ranges.py). Catches what output checks can't: visiting pad
+    tiles under the mask is correct, just slow."""
+    got = _kernel_schedule(cfg, split_full)
+    for m, plan in enumerate(got):
+        ref = fwd_schedule(m, **cfg.kwargs(), split_full=split_full)
+        assert plan == [(list(t), masked) for t, masked in ref], f"m={m}: kernel {plan} != reference {ref}"

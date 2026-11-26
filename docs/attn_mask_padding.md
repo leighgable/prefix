@@ -1,6 +1,6 @@
 # Handoff: padding support (`kv_start`) in the prefix sliding kernels
 
-Status: **milestone 1 done** (see "Progress" at the end).
+Status: **milestones 1–2 done** (see "Progress" at the end).
 Originally: Written at the end of a session in the llung
 repo (`~/Code/llung`), which consumes this repo for `LatentLM`'s
 attention. Decisions below are made — implement, don't re-litigate.
@@ -178,6 +178,38 @@ Run the relevant tests after each one, and the full suite at the end.
   with zero gradients; gradcheck covers padded layouts; flex_attention
   agrees on the padded cases.
 - Baseline is now 502 passed (this env).
+
+**Milestone 2 (forward): done.**
+- `fwd.py`: `first_at_or_after` (jit port of `_stored_first_at_or_after`);
+  `kv_tile_ranges(row_lo, qs, P, E, S, W, ...)` now returns
+  `(a_start, a_end, b_start, b_end)`; new `fwd_segments(...)` holds the
+  six-segment plan (pulled out of the kernel so a test can probe it);
+  `_tiles` masks `k_abs >= S` in masked tiles (1-D key mask, folded into
+  the bounds check); kernel arg `KvStart` (int32 `[B]`) after `QStart`;
+  `prefix_sliding_attention_fwd(..., kv_start=0)`. NaN guards were already
+  there (`m_safe`, the `empty` epilogue). Pad rows give out 0, lse -inf,
+  stats `M = +inf`, `log2 l = 0`.
+- `bwd.py` `_bwd_dq` calls the new `kv_tile_ranges` with `S = P * 0` and
+  loops `[a_start, a_end)`. **Milestone 3 must load the real `S` there**
+  (marked `TODO(milestone 3)`), plus `S` in `_allowed` / `_bwd_dkdv`.
+- **Bit-for-bit at S = 0, verified:** fwd (out / lse / stats, split and
+  unsplit, ± rel_bias, bf16 + fp32, two forced configs) and bwd
+  (dq / dk / dv / dbias) over all `CASES` with D <= 128 (1426 tensors) are
+  `torch.equal` to HEAD `8c43ed9`. (Script: forced configs only, since a
+  source change re-autotunes.) The fwd bench at S = 0 is unchanged within
+  noise (±10% on this iGPU, no systematic shift).
+- Tests (`test_fwd.py`, "left padding" and "tile schedule" sections):
+  `PADDED_CASES` bf16 + fp32, autotuned padded cases, a deterministic
+  padding residue sweep (S at every residue; S in the prefix, the tail,
+  and the evicted gap), padded random layouts (fp32 ± rel_bias, bf16),
+  pad rows NaN-free with huge scores (split and unsplit), padded batch ==
+  each row run unpadded, split == always-mask, and
+  `test_schedule_mirrors_reference`: a probe kernel runs `fwd_segments`
+  and must equal `reference.fwd_schedule` segment by segment (catches
+  visiting pad tiles, which output checks can't). A mutation check of each
+  new kernel condition is caught.
+- Baseline is now 533 passed (this env; cold autotune took 18 min).
+
 - **llung env:** 12 `tests/test_integration.py` cache tests (the `ring` /
   `eviction` caches and `generate`) already fail **at HEAD `21e053b`**
   (torch 2.15.0, transformers 5.24.1 there, vs 5.22.2 here). That's
